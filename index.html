@@ -1,0 +1,354 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Retail Doctor Dashboard - Odoo Community</title>
+
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+
+  <style>
+    body { margin: 0; background: #0f172a; color: #f8fafc; font-family: Inter, Arial, sans-serif; }
+    input[type="file"] { font-size: 13px; }
+    canvas { max-height: 320px; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script type="text/babel">
+    const { useEffect, useMemo, useRef, useState } = React;
+
+    const currency = new Intl.NumberFormat('es-CL', { style: 'currency', currency: 'CLP', maximumFractionDigits: 0 });
+
+    function normalizeKey(value) {
+      return String(value || '')
+        .toLowerCase()
+        .normalize('NFD')
+        .replace(/[̀-ͯ]/g, '')
+        .replace(/[^a-z0-9]+/g, ' ')
+        .trim();
+    }
+
+    function toNumber(value) {
+      if (value === null || value === undefined || value === '') return 0;
+      if (typeof value === 'number') return Number.isFinite(value) ? value : 0;
+      let text = String(value).replaceAll('$', '').replaceAll('CLP', '').replaceAll(' ', '').trim();
+      if (!text) return 0;
+      const hasComma = text.includes(',');
+      const hasDot = text.includes('.');
+      if (hasComma && hasDot) text = text.replaceAll('.', '').replace(',', '.');
+      else if (hasComma && !hasDot) text = text.replace(',', '.');
+      const n = Number(text);
+      return Number.isFinite(n) ? n : 0;
+    }
+
+    function excelDateToJSDate(serial) {
+      if (!serial || typeof serial !== 'number') return null;
+      const utcDays = Math.floor(serial - 25569);
+      const utcValue = utcDays * 86400;
+      const dateInfo = new Date(utcValue * 1000);
+      const fractionalDay = serial - Math.floor(serial) + 0.0000001;
+      const totalSeconds = Math.floor(86400 * fractionalDay);
+      dateInfo.setSeconds(totalSeconds);
+      return dateInfo;
+    }
+
+    function formatDate(value) {
+      if (typeof value === 'number') {
+        const d = excelDateToJSDate(value);
+        if (d) return d.toLocaleDateString('es-CL');
+      }
+      return String(value || '');
+    }
+
+    function getByAliases(row, aliases) {
+      const normalizedAliases = aliases.map(normalizeKey);
+      for (const [key, value] of Object.entries(row || {})) {
+        const normalizedKey = normalizeKey(key);
+        if (normalizedAliases.some(alias => normalizedKey === alias || normalizedKey.includes(alias))) return value;
+      }
+      return undefined;
+    }
+
+    function isNonEmpty(value) {
+      return String(value ?? '').trim() !== '';
+    }
+
+    function cleanGenericRows(rows) {
+      return rows.filter(row => Object.values(row || {}).some(isNonEmpty));
+    }
+
+    function parsePosOrderExport(rawRows) {
+      const lines = [];
+      let currentOrder = { fecha: '', ref: '', estado: '', recibo: '', sesion: '', metodoPago: '' };
+
+      rawRows.forEach((row, index) => {
+        const fecha = getByAliases(row, ['fecha']);
+        const ref = getByAliases(row, ['ref de la orden', 'referencia', 'orden']);
+        const estado = getByAliases(row, ['estado']);
+        const recibo = getByAliases(row, ['numero de recibo', 'recibo']);
+        const sesion = getByAliases(row, ['sesion']);
+        const metodoPago = getByAliases(row, ['pagos metodo de pago', 'metodo de pago', 'payment method']);
+
+        if (isNonEmpty(fecha) || isNonEmpty(ref)) {
+          currentOrder = {
+            fecha: isNonEmpty(fecha) ? fecha : currentOrder.fecha,
+            ref: isNonEmpty(ref) ? ref : currentOrder.ref,
+            estado: isNonEmpty(estado) ? estado : currentOrder.estado,
+            recibo: isNonEmpty(recibo) ? recibo : currentOrder.recibo,
+            sesion: isNonEmpty(sesion) ? sesion : currentOrder.sesion,
+            metodoPago: isNonEmpty(metodoPago) ? metodoPago : currentOrder.metodoPago
+          };
+        } else if (isNonEmpty(metodoPago) && !isNonEmpty(getByAliases(row, ['lineas del pedido']))) {
+          currentOrder.metodoPago = metodoPago;
+        }
+
+        const producto = getByAliases(row, ['lineas del pedido']);
+        const cantidad = toNumber(getByAliases(row, ['lineas del pedido cantidad', 'cantidad']));
+        const precioUnitarioNeto = toNumber(getByAliases(row, ['lineas del pedido precio un', 'precio un']));
+        const costoTotal = toNumber(getByAliases(row, ['lineas del pedido costo total', 'costo total']));
+        const impuestoLinea = getByAliases(row, ['lineas del pedido impuestos para aplicar', 'impuestos para aplicar']);
+
+        // En este export de Odoo, las filas en blanco no son error: son líneas adicionales del mismo pedido.
+        // Se heredan Fecha, Ref. de orden, Estado, Recibo y Sesión desde la última fila de pedido completa.
+        if (!isNonEmpty(producto)) return;
+        if (cantidad <= 0 && precioUnitarioNeto <= 0) return;
+
+        const subtotalNeto = cantidad * precioUnitarioNeto;
+        const margenCalculado = subtotalNeto - costoTotal;
+
+        lines.push({
+          __row: index + 2,
+          fecha: currentOrder.fecha,
+          fechaTexto: formatDate(currentOrder.fecha),
+          ref: currentOrder.ref,
+          estado: currentOrder.estado,
+          recibo: currentOrder.recibo,
+          sesion: currentOrder.sesion,
+          metodoPago: currentOrder.metodoPago || metodoPago || 'Sin método',
+          producto: String(producto).trim(),
+          cantidad,
+          precioUnitarioNeto,
+          subtotalNeto,
+          costoTotal,
+          margenCalculado,
+          margenPct: subtotalNeto ? margenCalculado / subtotalNeto : 0,
+          impuestoLinea
+        });
+      });
+
+      return lines;
+    }
+
+    function UploadCard({ title, description, type, onLoad, loadedRows }) {
+      async function handleFile(event) {
+        const file = event.target.files?.[0];
+        if (!file) return;
+        try {
+          const buffer = await file.arrayBuffer();
+          const workbook = XLSX.read(buffer, { type: 'array' });
+          const sheet = workbook.Sheets[workbook.SheetNames[0]];
+          const rows = XLSX.utils.sheet_to_json(sheet, { defval: '' });
+          const parsed = type === 'sales' ? parsePosOrderExport(rows) : cleanGenericRows(rows);
+          onLoad(parsed, file.name);
+        } catch (error) {
+          alert('No se pudo leer el archivo. Revisá que sea .xlsx o .xls exportado desde Odoo.');
+          console.error(error);
+        }
+      }
+
+      return (
+        <div className="rounded-2xl bg-slate-800/80 border border-slate-700 p-5 shadow-lg">
+          <div className="flex items-start justify-between gap-4 mb-4">
+            <div>
+              <h3 className="font-semibold text-lg">{title}</h3>
+              <p className="text-sm text-slate-400 mt-1">{description}</p>
+            </div>
+            <span className={`text-xs px-3 py-1 rounded-full ${loadedRows > 0 ? 'bg-emerald-500/20 text-emerald-300' : 'bg-slate-700 text-slate-300'}`}>
+              {loadedRows > 0 ? `${loadedRows} líneas` : 'pendiente'}
+            </span>
+          </div>
+          <input className="block w-full text-slate-300" type="file" accept=".xlsx,.xls" onChange={handleFile} />
+        </div>
+      );
+    }
+
+    function MetricCard({ title, value, helper }) {
+      return (
+        <div className="rounded-2xl bg-slate-800/80 border border-slate-700 p-5 shadow-lg">
+          <p className="text-sm text-slate-400">{title}</p>
+          <p className="text-3xl font-bold mt-2">{value}</p>
+          {helper && <p className="text-xs text-slate-500 mt-2">{helper}</p>}
+        </div>
+      );
+    }
+
+    function App() {
+      const [salesRows, setSalesRows] = useState([]);
+      const [purchaseRows, setPurchaseRows] = useState([]);
+      const [inventoryRows, setInventoryRows] = useState([]);
+      const [files, setFiles] = useState({ sales: '', purchases: '', inventory: '' });
+      const chartRef = useRef(null);
+      const chartInstanceRef = useRef(null);
+
+      const metrics = useMemo(() => {
+        let totalSales = 0;
+        let totalCost = 0;
+        let totalMargin = 0;
+        let totalPurchases = 0;
+        let inventoryValue = 0;
+        const productSales = {};
+        const paymentSales = {};
+        const orders = new Set();
+
+        salesRows.forEach(row => {
+          totalSales += row.subtotalNeto || 0;
+          totalCost += row.costoTotal || 0;
+          totalMargin += row.margenCalculado || 0;
+          if (row.ref) orders.add(row.ref);
+          productSales[row.producto] = (productSales[row.producto] || 0) + (row.subtotalNeto || 0);
+          paymentSales[row.metodoPago] = (paymentSales[row.metodoPago] || 0) + (row.subtotalNeto || 0);
+        });
+
+        purchaseRows.forEach(row => {
+          const total = toNumber(getByAliases(row, ['total sin impuestos', 'subtotal sin impuestos', 'precio total', 'total', 'subtotal', 'importe', 'amount']));
+          totalPurchases += total;
+        });
+
+        inventoryRows.forEach(row => {
+          const qty = toNumber(getByAliases(row, ['cantidad a mano', 'on hand', 'stock', 'quantity on hand', 'cantidad disponible', 'disponible']));
+          const cost = toNumber(getByAliases(row, ['coste', 'costo', 'cost', 'standard price', 'precio de coste']));
+          const value = toNumber(getByAliases(row, ['valor inventario', 'inventory value', 'valor', 'valuation']));
+          inventoryValue += value || (qty * cost);
+        });
+
+        const topProducts = Object.entries(productSales).sort((a, b) => b[1] - a[1]).slice(0, 10);
+        const payments = Object.entries(paymentSales).sort((a, b) => b[1] - a[1]);
+
+        return {
+          totalSales,
+          totalCost,
+          totalMargin,
+          totalPurchases,
+          inventoryValue,
+          marginPercent: totalSales ? totalMargin / totalSales : 0,
+          topProducts,
+          payments,
+          orderCount: orders.size,
+          avgTicket: orders.size ? totalSales / orders.size : 0
+        };
+      }, [salesRows, purchaseRows, inventoryRows]);
+
+      useEffect(() => {
+        if (!chartRef.current) return;
+        if (chartInstanceRef.current) chartInstanceRef.current.destroy();
+        chartInstanceRef.current = new Chart(chartRef.current, {
+          type: 'bar',
+          data: {
+            labels: metrics.topProducts.map(([name]) => String(name).slice(0, 30)),
+            datasets: [{ label: 'Ventas netas por producto', data: metrics.topProducts.map(([, value]) => value), borderWidth: 1 }]
+          },
+          options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            plugins: { legend: { labels: { color: '#cbd5e1' } } },
+            scales: {
+              x: { ticks: { color: '#cbd5e1' }, grid: { color: '#334155' } },
+              y: { ticks: { color: '#cbd5e1' }, grid: { color: '#334155' } }
+            }
+          }
+        });
+      }, [metrics.topProducts]);
+
+      const retailAlerts = useMemo(() => {
+        const alerts = [];
+        if (!salesRows.length) alerts.push('Cargá ventas POS. Este parser acepta líneas en blanco y hereda los datos del pedido anterior.');
+        if (salesRows.length) alerts.push('Ventas POS cargadas: se calcula venta neta como Líneas del pedido/Cantidad × Líneas del pedido/Precio un.');
+        if (!inventoryRows.length) alerts.push('Cargá inventario para detectar capital inmovilizado y stock muerto.');
+        if (!purchaseRows.length) alerts.push('Cargá compras para analizar presión de caja y evolución de costos.');
+        if (metrics.marginPercent > 0 && metrics.marginPercent < 0.25) alerts.push('Margen bruto bajo: revisar precios, costos o descuentos.');
+        if (metrics.inventoryValue > metrics.totalSales && metrics.totalSales > 0) alerts.push('El valor de inventario supera las ventas cargadas: revisar sobrestock o período analizado.');
+        return alerts;
+      }, [salesRows.length, inventoryRows.length, purchaseRows.length, metrics]);
+
+      return (
+        <main className="min-h-screen p-5 md:p-8">
+          <section className="max-w-7xl mx-auto">
+            <div className="mb-8">
+              <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-emerald-500/10 border border-emerald-500/20 text-emerald-300 text-xs mb-4">MVP local para Odoo Community</div>
+              <h1 className="text-3xl md:text-5xl font-bold tracking-tight">Retail Doctor Dashboard</h1>
+              <p className="text-slate-400 mt-3 max-w-3xl">
+                Parser ajustado para tu export de <b>Órdenes del punto de venta</b>: mantiene juntas las líneas del mismo pedido aunque Odoo deje celdas en blanco.
+              </p>
+            </div>
+
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-8">
+              <UploadCard title="Ventas POS" description="Órdenes del punto de venta con Líneas del pedido." type="sales" loadedRows={salesRows.length} onLoad={(rows, fileName) => { setSalesRows(rows); setFiles(prev => ({...prev, sales: fileName})); }} />
+              <UploadCard title="Compras" description="Reporte de análisis de compras." type="purchases" loadedRows={purchaseRows.length} onLoad={(rows, fileName) => { setPurchaseRows(rows); setFiles(prev => ({...prev, purchases: fileName})); }} />
+              <UploadCard title="Inventario" description="Variantes de producto / stock actual." type="inventory" loadedRows={inventoryRows.length} onLoad={(rows, fileName) => { setInventoryRows(rows); setFiles(prev => ({...prev, inventory: fileName})); }} />
+            </div>
+
+            <div className="grid grid-cols-1 md:grid-cols-4 gap-4 mb-8">
+              <MetricCard title="Ventas netas POS" value={currency.format(metrics.totalSales)} helper={files.sales || 'Sin archivo POS'} />
+              <MetricCard title="Margen calculado" value={currency.format(metrics.totalMargin)} helper={`${(metrics.marginPercent * 100).toFixed(1)}% sobre ventas netas`} />
+              <MetricCard title="Tickets" value={metrics.orderCount.toLocaleString('es-CL')} helper={`Ticket promedio: ${currency.format(metrics.avgTicket)}`} />
+              <MetricCard title="Valor inventario" value={currency.format(metrics.inventoryValue)} helper={files.inventory || 'Sin archivo inventario'} />
+            </div>
+
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-8">
+              <div className="rounded-2xl bg-slate-800/80 border border-slate-700 p-5 shadow-lg">
+                <h2 className="text-xl font-semibold mb-1">Ventas por producto</h2>
+                <p className="text-sm text-slate-400 mb-4">Calculado desde las líneas del pedido, sin duplicar el total del ticket.</p>
+                <div className="h-80"><canvas ref={chartRef}></canvas></div>
+              </div>
+
+              <div className="rounded-2xl bg-slate-800/80 border border-slate-700 p-5 shadow-lg">
+                <h2 className="text-xl font-semibold mb-1">Top productos por venta neta</h2>
+                <p className="text-sm text-slate-400 mb-4">Base para productos estrella, gancho, volumen y cash killers.</p>
+                <div className="space-y-3">
+                  {metrics.topProducts.length ? metrics.topProducts.map(([name, value], index) => (
+                    <div key={name + index} className="flex items-center justify-between gap-4 bg-slate-900/60 rounded-xl px-4 py-3">
+                      <div className="flex items-center gap-3 min-w-0">
+                        <span className="w-7 h-7 rounded-full bg-slate-700 flex items-center justify-center text-xs">{index + 1}</span>
+                        <span className="truncate text-sm">{name}</span>
+                      </div>
+                      <span className="text-sm font-semibold whitespace-nowrap">{currency.format(value)}</span>
+                    </div>
+                  )) : <p className="text-slate-400 text-sm">Todavía no hay ventas cargadas.</p>}
+                </div>
+              </div>
+            </div>
+
+            <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+              <div className="lg:col-span-2 rounded-2xl bg-slate-800/80 border border-slate-700 p-5 shadow-lg">
+                <h2 className="text-xl font-semibold mb-1">Alertas iniciales</h2>
+                <p className="text-sm text-slate-400 mb-4">Lectura preliminar para Retail Doctor + Profit First.</p>
+                <div className="space-y-3">
+                  {retailAlerts.map((alert, index) => <div key={index} className="rounded-xl bg-slate-900/70 border border-slate-700 px-4 py-3 text-sm text-slate-200">{alert}</div>)}
+                </div>
+              </div>
+
+              <div className="rounded-2xl bg-slate-800/80 border border-slate-700 p-5 shadow-lg">
+                <h2 className="text-xl font-semibold mb-4">Validación del parser</h2>
+                <div className="space-y-3 text-sm">
+                  <div className="rounded-xl bg-slate-900/70 p-4"><p className="font-semibold">Líneas POS usadas</p><p className="text-slate-400 mt-1">{salesRows.length} líneas de producto.</p></div>
+                  <div className="rounded-xl bg-slate-900/70 p-4"><p className="font-semibold">Regla de venta neta</p><p className="text-slate-400 mt-1">Cantidad × Precio un. de la línea.</p></div>
+                  <div className="rounded-xl bg-slate-900/70 p-4"><p className="font-semibold">Campos heredados</p><p className="text-slate-400 mt-1">Fecha, Ref., Estado, Recibo y Sesión del pedido.</p></div>
+                </div>
+              </div>
+            </div>
+          </section>
+        </main>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+</body>
+</html>
