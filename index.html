@@ -659,12 +659,14 @@
       const weeklyChartRef = useRef(null);
       const dailyComparisonChartRef = useRef(null);
       const weeklyTotalsChartRef = useRef(null);
+      const dailySalesBarsChartRef = useRef(null);
       const productEvolutionChartRef = useRef(null);
       const topProductsChartInstanceRef = useRef(null);
       const supplierChartInstanceRef = useRef(null);
       const weeklyChartInstanceRef = useRef(null);
       const dailyComparisonChartInstanceRef = useRef(null);
       const weeklyTotalsChartInstanceRef = useRef(null);
+      const dailySalesBarsChartInstanceRef = useRef(null);
       const productEvolutionChartInstanceRef = useRef(null);
 
       const metrics = useMemo(() => {
@@ -828,6 +830,13 @@
           ]
         };
 
+        const dailySalesSeries = Object.values(salesByDate)
+          .sort((a, b) => a.date - b.date)
+          .map(item => ({
+            label: item.date.toLocaleDateString('es-CL'),
+            totalSales: item.totalSales
+          }));
+
         const monthTotals = {};
         Object.values(salesByDate).forEach(item => {
           const key = monthKey(item.date);
@@ -920,6 +929,7 @@
           weeklyComparative,
           dailyComparative,
           weekTotalsComparison,
+          dailySalesSeries,
           monthlyComparison,
           payments,
           topSuppliers,
@@ -936,6 +946,11 @@
           avgTicket: saleOrders.size ? totalSales / saleOrders.size : 0
         };
       }, [salesRows, purchaseRows, inventoryRows, supplierInvoiceRows, cashInHand, cashInBank]);
+
+      const dailyAverageSales = useMemo(() => {
+        if (!metrics.dailySalesSeries.length) return 0;
+        return metrics.dailySalesSeries.reduce((sum, item) => sum + item.totalSales, 0) / metrics.dailySalesSeries.length;
+      }, [metrics.dailySalesSeries]);
 
       const trendProducts = useMemo(() => {
         const totalsByProduct = {};
@@ -1198,6 +1213,47 @@
       }, [metrics.weekTotalsComparison]);
 
       useEffect(() => {
+        if (!dailySalesBarsChartRef.current) return;
+        if (dailySalesBarsChartInstanceRef.current) dailySalesBarsChartInstanceRef.current.destroy();
+        if (!metrics.dailySalesSeries.length) return;
+        const averageDailySales = metrics.dailySalesSeries.reduce((sum, item) => sum + item.totalSales, 0) / metrics.dailySalesSeries.length;
+        dailySalesBarsChartInstanceRef.current = new Chart(dailySalesBarsChartRef.current, {
+          type: 'bar',
+          data: {
+            labels: metrics.dailySalesSeries.map(item => item.label),
+            datasets: [
+              {
+                label: 'Ventas netas diarias',
+                data: metrics.dailySalesSeries.map(item => item.totalSales),
+                backgroundColor: '#22c55e',
+                borderRadius: 6
+              },
+              {
+                type: 'line',
+                label: `Promedio diario (${currency.format(averageDailySales)})`,
+                data: metrics.dailySalesSeries.map(() => averageDailySales),
+                borderColor: '#f59e0b',
+                backgroundColor: '#f59e0b',
+                borderWidth: 2,
+                borderDash: [6, 6],
+                pointRadius: 0,
+                tension: 0
+              }
+            ]
+          },
+          options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            plugins: { legend: { labels: { color: '#cbd5e1' } } },
+            scales: {
+              x: { ticks: { color: '#cbd5e1' }, grid: { color: '#334155' } },
+              y: { ticks: { color: '#cbd5e1' }, grid: { color: '#334155' } }
+            }
+          }
+        });
+      }, [metrics.dailySalesSeries]);
+
+      useEffect(() => {
         if (!productEvolutionChartRef.current) return;
         if (productEvolutionChartInstanceRef.current) productEvolutionChartInstanceRef.current.destroy();
         if (!productTrendSeries.labels.length) return;
@@ -1357,6 +1413,18 @@
               <p className="text-sm text-slate-400 mb-4">Barras verticales con total de ventas netas y lineas de pedido: semana actual vs semana anterior.</p>
               <div className="h-80">
                 {metrics.weeklyComparative.length > 1 ? <canvas ref={weeklyTotalsChartRef}></canvas> : <p className="text-slate-400 text-sm">Necesitas al menos dos semanas con ventas para comparar totales semanales.</p>}
+              </div>
+            </div>
+
+            <div className="rounded-2xl bg-slate-800/80 border border-slate-700 p-5 shadow-lg mb-8">
+              <h2 className="text-xl font-semibold mb-1">Ventas netas diarias</h2>
+              <p className="text-sm text-slate-400 mb-4">Evolución diaria por fecha con el total de ventas netas de cada día.</p>
+              <div className="inline-flex items-center gap-2 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 mb-4">
+                <span className="inline-block w-6 h-0.5 border-t-2 border-dashed border-amber-400"></span>
+                <p className="text-sm text-amber-200">Promedio diario: <span className="font-semibold">{currency.format(dailyAverageSales)}</span></p>
+              </div>
+              <div className="h-80">
+                {metrics.dailySalesSeries.length ? <canvas ref={dailySalesBarsChartRef}></canvas> : <p className="text-slate-400 text-sm">Cargá ventas con fecha para ver el gráfico diario.</p>}
               </div>
             </div>
 
