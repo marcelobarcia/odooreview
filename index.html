@@ -711,16 +711,18 @@
             totalReportedMargin += row.margenPedido || 0;
           }
 
+          const lineNetSales = row.subtotalNeto || 0;
           const lineTax = toNumber(row.impuestoLinea);
+          const lineGrossSales = lineNetSales + lineTax;
           lineSalesTax += lineTax;
-          lineSalesWithTax += (row.subtotalNeto || 0) + lineTax;
+          lineSalesWithTax += lineGrossSales;
 
           if (row.ref) {
             const isRefund = isRefundReference(row.ref) || (row.subtotalNeto || 0) < 0;
             if (isRefund) refundOrders.add(row.ref);
             else saleOrders.add(row.ref);
           }
-          productSales[row.producto] = (productSales[row.producto] || 0) + (row.subtotalNeto || 0);
+          productSales[row.producto] = (productSales[row.producto] || 0) + lineGrossSales;
           salesByProduct[row.producto] = (salesByProduct[row.producto] || 0) + (row.cantidad || 0);
           paymentSales[row.metodoPago] = (paymentSales[row.metodoPago] || 0) + (row.subtotalNeto || 0);
 
@@ -730,7 +732,7 @@
             if (!salesByDate[dateKey]) {
               salesByDate[dateKey] = { date: parsedDate, totalSales: 0, totalOrderLines: 0 };
             }
-            salesByDate[dateKey].totalSales += row.subtotalNeto || 0;
+            salesByDate[dateKey].totalSales += lineGrossSales;
             salesByDate[dateKey].totalOrderLines += 1;
 
             const weekStart = getWeekStart(parsedDate);
@@ -738,7 +740,7 @@
             if (!weeklyBuckets[key]) {
               weeklyBuckets[key] = { weekStart, totalSales: 0, totalUnits: 0, totalOrderLines: 0 };
             }
-            weeklyBuckets[key].totalSales += row.subtotalNeto || 0;
+            weeklyBuckets[key].totalSales += lineGrossSales;
             weeklyBuckets[key].totalOrderLines += 1;
           }
         });
@@ -956,7 +958,8 @@
         const totalsByProduct = {};
         salesRows.forEach(row => {
           if (!row.producto) return;
-          totalsByProduct[row.producto] = (totalsByProduct[row.producto] || 0) + (row.subtotalNeto || 0);
+          const gross = (row.subtotalNeto || 0) + toNumber(row.impuestoLinea);
+          totalsByProduct[row.producto] = (totalsByProduct[row.producto] || 0) + gross;
         });
         return Object.entries(totalsByProduct)
           .sort((a, b) => b[1] - a[1])
@@ -1007,7 +1010,7 @@
             buckets[key] = { label, sortDate, sales: 0, units: 0 };
           }
 
-          buckets[key].sales += row.subtotalNeto || 0;
+          buckets[key].sales += (row.subtotalNeto || 0) + toNumber(row.impuestoLinea);
           buckets[key].units += row.cantidad || 0;
         });
 
@@ -1028,7 +1031,7 @@
           type: 'bar',
           data: {
             labels: metrics.topProducts.map(([name]) => String(name).slice(0, 30)),
-            datasets: [{ label: 'Ventas netas por producto', data: metrics.topProducts.map(([, value]) => value), borderWidth: 1 }]
+            datasets: [{ label: 'Ventas con IVA por producto', data: metrics.topProducts.map(([, value]) => value), borderWidth: 1 }]
           },
           options: {
             responsive: true,
@@ -1074,7 +1077,7 @@
             datasets: [
               {
                 type: 'bar',
-                label: 'Ventas netas',
+                label: 'Ventas con IVA',
                 data: metrics.weeklyComparative.map(item => item.totalSales),
                 backgroundColor: '#0ea5e9',
                 borderRadius: 6,
@@ -1118,7 +1121,7 @@
             datasets: [
               {
                 type: 'bar',
-                label: `Ventas netas ${metrics.dailyComparative.currentWeekLabel}`,
+                label: `Ventas con IVA ${metrics.dailyComparative.currentWeekLabel}`,
                 data: metrics.dailyComparative.currentWeekDailySales,
                 backgroundColor: '#22c55e',
                 borderRadius: 6,
@@ -1126,7 +1129,7 @@
               },
               {
                 type: 'bar',
-                label: `Ventas netas ${metrics.dailyComparative.previousWeekLabel}`,
+                label: `Ventas con IVA ${metrics.dailyComparative.previousWeekLabel}`,
                 data: metrics.dailyComparative.previousWeekDailySales,
                 backgroundColor: '#0ea5e9',
                 borderRadius: 6,
@@ -1180,7 +1183,7 @@
             labels: metrics.weekTotalsComparison.labels,
             datasets: [
               {
-                label: 'Ventas netas semanales',
+                label: 'Ventas con IVA semanales',
                 data: metrics.weekTotalsComparison.sales,
                 backgroundColor: '#14b8a6',
                 borderRadius: 8,
@@ -1223,7 +1226,7 @@
             labels: metrics.dailySalesSeries.map(item => item.label),
             datasets: [
               {
-                label: 'Ventas netas diarias',
+                label: 'Ventas con IVA diarias',
                 data: metrics.dailySalesSeries.map(item => item.totalSales),
                 backgroundColor: '#22c55e',
                 borderRadius: 6
@@ -1267,7 +1270,7 @@
             labels: productTrendSeries.labels,
             datasets: [
               {
-                label: `Ventas netas (${productLabel})`,
+                label: `Ventas con IVA (${productLabel})`,
                 data: productTrendSeries.sales,
                 borderColor: '#22d3ee',
                 backgroundColor: 'rgba(34, 211, 238, 0.18)',
@@ -1394,7 +1397,7 @@
 
             <div className="rounded-2xl bg-slate-800/80 border border-slate-700 p-5 shadow-lg mb-8">
               <h2 className="text-xl font-semibold mb-1">Comparativo semanal de ventas</h2>
-              <p className="text-sm text-slate-400 mb-4">Barras: ventas netas por semana. Línea: líneas de pedido.</p>
+              <p className="text-sm text-slate-400 mb-4">Barras: ventas con IVA por semana. Línea: líneas de pedido.</p>
               <div className="h-80">
                 {metrics.weeklyComparative.length ? <canvas ref={weeklyChartRef}></canvas> : <p className="text-slate-400 text-sm">Cargá ventas con fecha para ver el comparativo semanal.</p>}
               </div>
@@ -1402,7 +1405,7 @@
 
             <div className="rounded-2xl bg-slate-800/80 border border-slate-700 p-5 shadow-lg mb-8">
               <h2 className="text-xl font-semibold mb-1">Comparativo diario vs semana anterior</h2>
-              <p className="text-sm text-slate-400 mb-4">Comparación por día (Lun-Dom) entre semana actual y semana previa en ventas netas y líneas de pedido.</p>
+              <p className="text-sm text-slate-400 mb-4">Comparación por día (Lun-Dom) entre semana actual y semana previa en ventas con IVA y líneas de pedido.</p>
               <div className="h-80">
                 {metrics.weeklyComparative.length > 1 ? <canvas ref={dailyComparisonChartRef}></canvas> : <p className="text-slate-400 text-sm">Necesitas al menos dos semanas con ventas para ver este comparativo.</p>}
               </div>
@@ -1410,15 +1413,15 @@
 
             <div className="rounded-2xl bg-slate-800/80 border border-slate-700 p-5 shadow-lg mb-8">
               <h2 className="text-xl font-semibold mb-1">Totales semanales comparados</h2>
-              <p className="text-sm text-slate-400 mb-4">Barras verticales con total de ventas netas y lineas de pedido: semana actual vs semana anterior.</p>
+              <p className="text-sm text-slate-400 mb-4">Barras verticales con total de ventas con IVA y lineas de pedido: semana actual vs semana anterior.</p>
               <div className="h-80">
                 {metrics.weeklyComparative.length > 1 ? <canvas ref={weeklyTotalsChartRef}></canvas> : <p className="text-slate-400 text-sm">Necesitas al menos dos semanas con ventas para comparar totales semanales.</p>}
               </div>
             </div>
 
             <div className="rounded-2xl bg-slate-800/80 border border-slate-700 p-5 shadow-lg mb-8">
-              <h2 className="text-xl font-semibold mb-1">Ventas netas diarias</h2>
-              <p className="text-sm text-slate-400 mb-4">Evolución diaria por fecha con el total de ventas netas de cada día.</p>
+              <h2 className="text-xl font-semibold mb-1">Ventas diarias con IVA</h2>
+              <p className="text-sm text-slate-400 mb-4">Evolución diaria por fecha con el total de ventas con IVA de cada día.</p>
               <div className="inline-flex items-center gap-2 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 mb-4">
                 <span className="inline-block w-6 h-0.5 border-t-2 border-dashed border-amber-400"></span>
                 <p className="text-sm text-amber-200">Promedio diario: <span className="font-semibold">{currency.format(dailyAverageSales)}</span></p>
@@ -1490,7 +1493,7 @@
                 </div>
 
                 <div className="md:ml-auto text-sm text-slate-300">
-                  <p>Total ventas: <span className="font-semibold text-cyan-200">{currency.format(productTrendSeries.totalSales)}</span></p>
+                  <p>Total ventas con IVA: <span className="font-semibold text-cyan-200">{currency.format(productTrendSeries.totalSales)}</span></p>
                   <p>Total unidades: <span className="font-semibold text-amber-200">{productTrendSeries.totalUnits.toLocaleString('es-CL')}</span></p>
                 </div>
               </div>
@@ -1505,7 +1508,7 @@
             <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-8">
               <div className="rounded-2xl bg-slate-800/80 border border-slate-700 p-5 shadow-lg">
                 <h2 className="text-xl font-semibold mb-1">Ventas por producto</h2>
-                <p className="text-sm text-slate-400 mb-4">Calculado desde las líneas del pedido, sin duplicar el total del ticket.</p>
+                <p className="text-sm text-slate-400 mb-4">Calculado desde las líneas del pedido con IVA incluido, sin duplicar el total del ticket.</p>
                 <div className="h-80"><canvas ref={topProductsChartRef}></canvas></div>
               </div>
 
@@ -1518,7 +1521,7 @@
 
             <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-8">
               <div className="rounded-2xl bg-slate-800/80 border border-slate-700 p-5 shadow-lg">
-                <h2 className="text-xl font-semibold mb-1">Top productos por venta neta</h2>
+                <h2 className="text-xl font-semibold mb-1">Top productos por venta con IVA</h2>
                 <p className="text-sm text-slate-400 mb-4">Base para productos estrella, gancho, volumen y cash killers.</p>
                 <div className="space-y-3">
                   {metrics.topProducts.length ? metrics.topProducts.map(([name, value], index) => (
