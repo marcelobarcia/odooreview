@@ -25,6 +25,8 @@
     const { useEffect, useMemo, useRef, useState } = React;
 
     const currency = new Intl.NumberFormat('es-CL', { style: 'currency', currency: 'CLP', maximumFractionDigits: 0 });
+    const percent = new Intl.NumberFormat('es-CL', { style: 'percent', maximumFractionDigits: 1 });
+    const PROFIT_FIRST_TARGETS = { ownerCompensation: 0.2, merchandise: 0.5, tax: 0.16, profit: 0.14 };
 
     function normalizeKey(value) {
       return String(value || '')
@@ -67,6 +69,57 @@
       return String(value || '');
     }
 
+    function parseDateValue(value) {
+      if (value instanceof Date && !Number.isNaN(value.getTime())) return value;
+      if (typeof value === 'number') return excelDateToJSDate(value);
+      const text = String(value || '').trim();
+      if (!text) return null;
+      const monthMap = {
+        ene: 0, feb: 1, mar: 2, abr: 3, may: 4, jun: 5,
+        jul: 6, ago: 7, sep: 8, oct: 9, nov: 10, dic: 11
+      };
+      const match = text.toLowerCase().match(/^(\d{1,2})\s+([a-z]{3})\s+(\d{4})$/);
+      if (match && monthMap[match[2]] !== undefined) {
+        const day = Number(match[1]);
+        const month = monthMap[match[2]];
+        const year = Number(match[3]);
+        return new Date(year, month, day);
+      }
+      const normalized = text.includes('/') ? text.split('/').reverse().join('-') : text;
+      const parsed = new Date(normalized);
+      return Number.isNaN(parsed.getTime()) ? null : parsed;
+    }
+
+    function getWeekStart(date) {
+      const d = new Date(date.getFullYear(), date.getMonth(), date.getDate());
+      const day = d.getDay();
+      const diff = day === 0 ? -6 : 1 - day;
+      d.setDate(d.getDate() + diff);
+      d.setHours(0, 0, 0, 0);
+      return d;
+    }
+
+    function formatWeekLabel(weekStart) {
+      const weekEnd = new Date(weekStart);
+      weekEnd.setDate(weekStart.getDate() + 6);
+      const from = weekStart.toLocaleDateString('es-CL', { day: '2-digit', month: 'short' });
+      const to = weekEnd.toLocaleDateString('es-CL', { day: '2-digit', month: 'short' });
+      return `${from} - ${to}`;
+    }
+
+    function monthKey(date) {
+      return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}`;
+    }
+
+    function formatMonthLabel(date) {
+      return date.toLocaleDateString('es-CL', { month: 'long', year: 'numeric' });
+    }
+
+    function dayIndexMondayFirst(date) {
+      const day = date.getDay();
+      return day === 0 ? 6 : day - 1;
+    }
+
     function getByAliases(row, aliases) {
       const normalizedAliases = aliases.map(normalizeKey);
       for (const [key, value] of Object.entries(row || {})) {
@@ -84,9 +137,47 @@
       return rows.filter(row => Object.values(row || {}).some(isNonEmpty));
     }
 
+    function firstText(row, aliases, fallback = '') {
+      const value = getByAliases(row, aliases);
+      return isNonEmpty(value) ? String(value).trim() : fallback;
+    }
+
+    function firstNumber(row, aliases, fallback = 0) {
+      for (const alias of aliases) {
+        const value = getByAliases(row, [alias]);
+        if (isNonEmpty(value)) return toNumber(value);
+      }
+      return fallback;
+    }
+
+    function isRefundReference(value) {
+      const normalized = normalizeKey(value);
+      return normalized.includes('reembolso') || normalized.includes('refund') || normalized.includes('devolucion');
+    }
+
+    function classifySupplierInvoiceType(proveedor, referencia = '', documento = '') {
+      const text = normalizeKey(`${proveedor} ${referencia} ${documento}`);
+      const nonInventoryKeywords = [
+        'chilquinta', 'movistar', 'contadora', 'asesor', 'dominio', 'email', 'godaddy',
+        'libreria', 'sticker', 'servicio', 'arriendo', 'galeria', 'flete', 'rollos',
+        'impresora', 'internet', 'telefono', 'luz', 'electric', 'posboleta'
+      ];
+      const inventoryKeywords = [
+        'comercializadora', 'distribuidora', 'emporio', 'huevomania', 'veguita',
+        'dical', 'difficile', 'mm', 'mall chino', 'mercaderia', 'granel', 'huevos', 'compra'
+      ];
+
+      if (nonInventoryKeywords.some(keyword => text.includes(keyword))) return 'otros_gastos';
+      if (inventoryKeywords.some(keyword => text.includes(keyword))) return 'mercaderia';
+      return 'otros_gastos';
+    }
+
     function parsePosOrderExport(rawRows) {
       const lines = [];
-      let currentOrder = { fecha: '', ref: '', estado: '', recibo: '', sesion: '', metodoPago: '' };
+      let currentOrder = {
+        fecha: '', ref: '', estado: '', recibo: '', sesion: '', metodoPago: '',
+        margenPedido: 0, margenPctPedido: 0, impuestoPedido: 0, totalPedido: 0
+      };
 
       rawRows.forEach((row, index) => {
         const fecha = getByAliases(row, ['fecha']);
@@ -95,6 +186,10 @@
         const recibo = getByAliases(row, ['numero de recibo', 'recibo']);
         const sesion = getByAliases(row, ['sesion']);
         const metodoPago = getByAliases(row, ['pagos metodo de pago', 'metodo de pago', 'payment method']);
+        const margenPedido = toNumber(getByAliases(row, ['margen']));
+        const margenPctPedido = toNumber(getByAliases(row, ['margen (%)', 'margen %']));
+        const impuestoPedido = toNumber(getByAliases(row, ['impuestos']));
+        const totalPedido = toNumber(getByAliases(row, ['total']));
 
         if (isNonEmpty(fecha) || isNonEmpty(ref)) {
           currentOrder = {
@@ -103,7 +198,11 @@
             estado: isNonEmpty(estado) ? estado : currentOrder.estado,
             recibo: isNonEmpty(recibo) ? recibo : currentOrder.recibo,
             sesion: isNonEmpty(sesion) ? sesion : currentOrder.sesion,
-            metodoPago: isNonEmpty(metodoPago) ? metodoPago : currentOrder.metodoPago
+            metodoPago: isNonEmpty(metodoPago) ? metodoPago : currentOrder.metodoPago,
+            margenPedido: margenPedido || currentOrder.margenPedido,
+            margenPctPedido: margenPctPedido || currentOrder.margenPctPedido,
+            impuestoPedido: impuestoPedido || currentOrder.impuestoPedido,
+            totalPedido: totalPedido || currentOrder.totalPedido
           };
         } else if (isNonEmpty(metodoPago) && !isNonEmpty(getByAliases(row, ['lineas del pedido']))) {
           currentOrder.metodoPago = metodoPago;
@@ -132,6 +231,10 @@
           recibo: currentOrder.recibo,
           sesion: currentOrder.sesion,
           metodoPago: currentOrder.metodoPago || metodoPago || 'Sin método',
+          margenPedido: currentOrder.margenPedido,
+          margenPctPedido: currentOrder.margenPctPedido,
+          impuestoPedido: currentOrder.impuestoPedido,
+          totalPedido: currentOrder.totalPedido,
           producto: String(producto).trim(),
           cantidad,
           precioUnitarioNeto,
@@ -146,6 +249,344 @@
       return lines;
     }
 
+    function parsePosAnalysisPivotExport(rawRows) {
+      const rows = cleanGenericRows(rawRows);
+      const lines = [];
+      let currentDate = '';
+      let currentRef = '';
+      let currentOrderDepth = 0;
+      let currentProductDepth = null;
+
+      rows.forEach((row, index) => {
+        const label = String(getByAliases(row, ['__empty']) || '').replace(/\u00a0/g, ' ');
+        const trimmedLabel = label.trim();
+        const depth = (label.match(/^\s*/) || [''])[0].length;
+
+        const cantidad = toNumber(getByAliases(row, ['cantidad producto', 'cantidad']));
+        const subtotalNeto = toNumber(getByAliases(row, ['subtotal sin impuestos']));
+        const total = toNumber(getByAliases(row, ['precio total', 'total']));
+        const margen = toNumber(getByAliases(row, ['margen']));
+        const impuestos = total - subtotalNeto;
+
+        const isDateRow = /^\d{1,2}\s+[a-z]{3}\s+\d{4}$/i.test(trimmedLabel);
+        const isOrderRow = /\//.test(trimmedLabel) && !isDateRow;
+
+        if (isDateRow) {
+          currentDate = trimmedLabel;
+          currentRef = '';
+          currentOrderDepth = 0;
+          currentProductDepth = null;
+          return;
+        }
+
+        if (isOrderRow) {
+          currentRef = trimmedLabel;
+          currentOrderDepth = depth;
+          currentProductDepth = null;
+          return;
+        }
+
+        if (!currentRef) return;
+        if (depth <= currentOrderDepth) return;
+        if (currentProductDepth === null) currentProductDepth = depth;
+        const isProductRow = depth === currentProductDepth && isNonEmpty(trimmedLabel) && subtotalNeto !== 0;
+
+        if (!isProductRow) return;
+
+        lines.push({
+          __row: index + 2,
+          fecha: currentDate,
+          fechaTexto: currentDate,
+          ref: currentRef || 'Ticket agregado',
+          estado: 'Analisis dinamico',
+          recibo: '',
+          sesion: '',
+          metodoPago: 'No disponible en tabla dinamica',
+          margenPedido: 0,
+          margenPctPedido: 0,
+          impuestoPedido: 0,
+          totalPedido: 0,
+          producto: trimmedLabel,
+          cantidad,
+          precioUnitarioNeto: cantidad ? subtotalNeto / cantidad : 0,
+          subtotalNeto,
+          costoTotal: subtotalNeto - margen,
+          margenCalculado: margen,
+          margenPct: subtotalNeto ? margen / subtotalNeto : 0,
+          impuestoLinea: impuestos
+        });
+      });
+
+      return lines;
+    }
+
+    function parsePosAnalysisPivotSheet(sheet) {
+      const matrix = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: '' });
+      if (!matrix.length) return [];
+
+      const metricRowIndex = matrix.findIndex(row => row.some(cell => normalizeKey(cell) === 'cantidad producto'));
+      if (metricRowIndex < 0) return [];
+
+      const metricRow = matrix[metricRowIndex] || [];
+      const pedidoColumns = [];
+      metricRow.forEach((cell, idx) => {
+        if (normalizeKey(cell) === 'pedido') pedidoColumns.push(idx);
+      });
+
+      if (!pedidoColumns.length) return [];
+
+      const lines = [];
+      let currentDate = '';
+      let currentRef = '';
+      let currentOrderDepth = 0;
+      let currentProductDepth = null;
+
+      for (let r = metricRowIndex + 1; r < matrix.length; r += 1) {
+        const row = matrix[r] || [];
+        const labelRaw = String(row[0] || '').replace(/\u00a0/g, ' ');
+        const label = labelRaw.trim();
+        if (!label || normalizeKey(label) === 'total') continue;
+
+        const depth = (labelRaw.match(/^\s*/) || [''])[0].length;
+        const isDateRow = /^\d{1,2}\s+[a-z]{3}\s+\d{4}$/i.test(label);
+        const isOrderRow = /\//.test(label) && !isDateRow;
+
+        let selected = null;
+        for (const start of pedidoColumns) {
+          const subtotal = toNumber(row[start + 4]);
+          const total = toNumber(row[start + 2]);
+          const margin = toNumber(row[start + 5]);
+          const qty = toNumber(row[start + 1]);
+          if (subtotal !== 0 || total !== 0 || margin !== 0 || qty !== 0) {
+            selected = { qty, subtotal, total, margin };
+          }
+        }
+
+        if (!selected) continue;
+
+        if (isDateRow) {
+          currentDate = label;
+          currentRef = '';
+          currentOrderDepth = 0;
+          currentProductDepth = null;
+          continue;
+        }
+
+        if (isOrderRow) {
+          currentRef = label;
+          currentOrderDepth = depth;
+          currentProductDepth = null;
+          continue;
+        }
+
+        if (!currentRef) continue;
+        if (depth <= currentOrderDepth) continue;
+        if (currentProductDepth === null) currentProductDepth = depth;
+
+        const isProductRow = depth === currentProductDepth;
+        if (!isProductRow) continue;
+
+        const impuestos = selected.total - selected.subtotal;
+        lines.push({
+          __row: r + 1,
+          fecha: currentDate,
+          fechaTexto: currentDate,
+          ref: currentRef || 'Ticket agregado',
+          estado: 'Analisis dinamico',
+          recibo: '',
+          sesion: '',
+          metodoPago: 'No disponible en tabla dinamica',
+          margenPedido: 0,
+          margenPctPedido: 0,
+          impuestoPedido: 0,
+          totalPedido: 0,
+          producto: label,
+          cantidad: selected.qty,
+          precioUnitarioNeto: selected.qty ? selected.subtotal / selected.qty : 0,
+          subtotalNeto: selected.subtotal,
+          costoTotal: selected.subtotal - selected.margin,
+          margenCalculado: selected.margin,
+          margenPct: selected.subtotal ? selected.margin / selected.subtotal : 0,
+          impuestoLinea: impuestos
+        });
+      }
+
+      return lines;
+    }
+
+    function parseSalesRows(rawRows) {
+      const hasOrderLineColumns = rawRows.some(row => isNonEmpty(getByAliases(row, ['lineas del pedido'])));
+      if (hasOrderLineColumns) return parsePosOrderExport(rawRows);
+      return parsePosAnalysisPivotExport(rawRows);
+    }
+
+    function parsePurchasePivotSheet(sheet) {
+      const matrix = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: '' });
+      if (!matrix.length) return [];
+
+      const headerRowIndex = matrix.findIndex(row => row.some(cell => normalizeKey(cell) === 'cant facturada'));
+      if (headerRowIndex < 0) return [];
+
+      const lines = [];
+      let currentDate = '';
+      let currentSupplier = '';
+      let currentSupplierDepth = 0;
+      let currentProductDepth = null;
+
+      for (let r = headerRowIndex + 1; r < matrix.length; r += 1) {
+        const row = matrix[r] || [];
+        const labelRaw = String(row[0] || '').replace(/\u00a0/g, ' ');
+        const label = labelRaw.trim();
+        if (!label || normalizeKey(label) === 'total') continue;
+
+        const depth = (labelRaw.match(/^\s*/) || [''])[0].length;
+        const numero = toNumber(row[1]);
+        const subtotal = toNumber(row[2]);
+        const total = toNumber(row[3]);
+        const cantidad = toNumber(row[4]);
+        const costoPromedio = toNumber(row[5]);
+        const lineas = toNumber(row[6]);
+
+        const isDateRow = /^\d{1,2}\s+[a-z]{3}\s+\d{4}$/i.test(label);
+        const isSupplierRow = !isDateRow && depth > 0 && numero > 0 && lineas > 1;
+
+        if (isDateRow) {
+          currentDate = label;
+          currentSupplier = '';
+          currentSupplierDepth = 0;
+          currentProductDepth = null;
+          continue;
+        }
+
+        if (isSupplierRow) {
+          currentSupplier = label;
+          currentSupplierDepth = depth;
+          currentProductDepth = null;
+          continue;
+        }
+
+        if (!currentSupplier) continue;
+        if (depth <= currentSupplierDepth) continue;
+        if (currentProductDepth === null) currentProductDepth = depth;
+        if (depth !== currentProductDepth) continue;
+
+        lines.push({
+          __row: r + 1,
+          fecha: currentDate,
+          fechaTexto: currentDate,
+          proveedor: currentSupplier,
+          documento: 'Analisis compra dinamico',
+          producto: label,
+          categoria: 'Sin categoría',
+          estado: 'Analisis dinamico',
+          cantidad,
+          costoUnitario: costoPromedio,
+          subtotal,
+          impuestos: total - subtotal,
+          total
+        });
+      }
+
+      return lines;
+    }
+
+    function parsePurchaseData(rawRows, sheet) {
+      const flatRows = parsePurchaseRows(rawRows);
+      const looksFlat = flatRows.some(row => row.proveedor !== 'Sin proveedor' || row.producto !== 'Sin detalle');
+      if (looksFlat) return flatRows;
+
+      const pivotRows = parsePurchasePivotSheet(sheet);
+      if (pivotRows.length) return pivotRows;
+
+      return flatRows;
+    }
+
+    function parsePurchaseRows(rawRows) {
+      return cleanGenericRows(rawRows).map((row, index) => {
+        const fecha = getByAliases(row, ['fecha', 'fecha pedido', 'order date', 'bill date']);
+        const cantidad = firstNumber(row, ['cantidad', 'qty', 'ordered qty', 'cantidad pedida', 'cantidad facturada'], 0);
+        const costoUnitario = firstNumber(row, ['coste unitario', 'costo unitario', 'precio unitario', 'unit price', 'price unit', 'cost'], 0);
+        const subtotal = firstNumber(row, ['subtotal sin impuestos', 'total sin impuestos', 'importe sin impuestos', 'untaxed amount', 'subtotal', 'amount untaxed'], cantidad * costoUnitario);
+        const impuestos = firstNumber(row, ['impuestos', 'tax', 'tax amount', 'monto impuesto'], 0);
+        const total = firstNumber(row, ['total', 'importe total', 'amount total'], subtotal + impuestos);
+
+        return {
+          __row: index + 2,
+          fecha,
+          fechaTexto: formatDate(fecha),
+          proveedor: firstText(row, ['proveedor', 'vendor', 'partner', 'partner name'], 'Sin proveedor'),
+          documento: firstText(row, ['referencia', 'pedido', 'purchase order', 'bill reference', 'origen'], 'Sin documento'),
+          producto: firstText(row, ['producto', 'product', 'descripcion', 'label'], 'Sin detalle'),
+          categoria: firstText(row, ['categoria', 'product category', 'categoria producto'], 'Sin categoría'),
+          estado: firstText(row, ['estado', 'status'], 'Sin estado'),
+          cantidad,
+          costoUnitario,
+          subtotal,
+          impuestos,
+          total
+        };
+      }).filter(row => row.total > 0 || row.subtotal > 0 || row.producto !== 'Sin detalle');
+    }
+
+    function parseInventoryRows(rawRows) {
+      return cleanGenericRows(rawRows).map((row, index) => {
+        const cantidad = firstNumber(row, [
+          'cantidad a la mano', 'cantidad a mano', 'cantidad disponible para uso',
+          'on hand', 'stock', 'quantity on hand', 'cantidad disponible', 'disponible'
+        ], 0);
+        const costo = firstNumber(row, ['costo promedio', 'coste', 'costo', 'cost', 'standard price', 'precio de coste'], 0);
+        const valor = firstNumber(row, ['valor total', 'valor inventario', 'inventory value', 'valor', 'valuation'], cantidad * costo);
+
+        return {
+          __row: index + 2,
+          producto: firstText(row, ['nombre mostrado', 'producto', 'product', 'nombre', 'display name'], 'Sin producto'),
+          categoria: firstText(row, ['categoria', 'product category'], 'Sin categoría'),
+          cantidad,
+          costo,
+          valor,
+          unidad: firstText(row, ['unidad de medida', 'uom', 'unit of measure'], ''),
+          sku: firstText(row, ['referencia interna', 'internal reference', 'sku'], '')
+        };
+      }).filter(row => row.cantidad > 0 || row.valor > 0 || row.producto !== 'Sin producto');
+    }
+
+    function parseSupplierInvoiceRows(rawRows) {
+      return cleanGenericRows(rawRows).map((row, index) => {
+        const fecha = getByAliases(row, ['fecha de la factura', 'fecha factura', 'invoice date', 'fecha', 'bill date']);
+        const vencimiento = getByAliases(row, ['fecha de vencimiento', 'fecha vencimiento', 'due date', 'invoice date due']);
+        const subtotalRaw = firstNumber(row, ['importe sin impuestos en la moneda firmada', 'total sin impuestos', 'untaxed amount', 'subtotal', 'amount untaxed'], 0);
+        const totalRaw = firstNumber(row, ['total en moneda firmado', 'total', 'amount total', 'residual', 'importe total'], subtotalRaw);
+        const subtotal = Math.abs(subtotalRaw);
+        const total = Math.abs(totalRaw);
+        const impuestos = Math.max(total - subtotal, 0);
+        const estado = firstText(row, ['estado en pago', 'estado', 'status', 'payment status'], 'Sin estado');
+        const proveedor = firstText(row, ['nombre del contacto a mostrar en la factura', 'proveedor', 'vendor', 'partner', 'partner name'], 'Sin proveedor');
+        const documento = firstText(row, ['numero', 'número', 'invoice number', 'bill reference', 'referencia'], 'Sin documento');
+        const referencia = firstText(row, ['referencia', 'ref', 'memo'], '');
+        const isPaid = normalizeKey(estado).includes('paid') || normalizeKey(estado).includes('pagado');
+        const saldo = isPaid ? 0 : total;
+        const tipoFactura = classifySupplierInvoiceType(proveedor, referencia, documento);
+
+        return {
+          __row: index + 2,
+          fecha,
+          fechaTexto: formatDate(fecha),
+          vencimiento,
+          vencimientoTexto: formatDate(vencimiento),
+          proveedor,
+          documento,
+          referencia,
+          estado,
+          tipoFactura,
+          subtotal,
+          impuestos,
+          total,
+          saldo,
+          pagada: isPaid || saldo <= 0
+        };
+      }).filter(row => row.total > 0 || row.saldo > 0 || row.documento !== 'Sin documento');
+    }
+
     function UploadCard({ title, description, type, onLoad, loadedRows }) {
       async function handleFile(event) {
         const file = event.target.files?.[0];
@@ -155,7 +596,20 @@
           const workbook = XLSX.read(buffer, { type: 'array' });
           const sheet = workbook.Sheets[workbook.SheetNames[0]];
           const rows = XLSX.utils.sheet_to_json(sheet, { defval: '' });
-          const parsed = type === 'sales' ? parsePosOrderExport(rows) : cleanGenericRows(rows);
+          let parsed = cleanGenericRows(rows);
+          if (type === 'sales') {
+            parsed = parseSalesRows(rows);
+            if (!parsed.length) parsed = parsePosAnalysisPivotSheet(sheet);
+          }
+          if (type === 'purchases') parsed = parsePurchaseData(rows, sheet);
+          if (type === 'inventory') parsed = parseInventoryRows(rows);
+          if (type === 'supplierInvoices') parsed = parseSupplierInvoiceRows(rows);
+          if (type === 'sales' && !parsed.length) {
+            alert('No se encontraron lineas de ventas en ese archivo. Si es tabla dinamica, revisa que mantenga columnas Pedido, Cantidad producto, Precio total, Subtotal sin impuestos y Margen.');
+          }
+          if (type === 'purchases' && !parsed.length) {
+            alert('No se encontraron lineas de compras en ese archivo. Si es tabla dinamica, revisa que mantenga columnas Numero, Subtotal, Total, Cant. facturada y Costo promedio.');
+          }
           onLoad(parsed, file.name);
         } catch (error) {
           alert('No se pudo leer el archivo. Revisá que sea .xlsx o .xls exportado desde Odoo.');
@@ -193,62 +647,295 @@
       const [salesRows, setSalesRows] = useState([]);
       const [purchaseRows, setPurchaseRows] = useState([]);
       const [inventoryRows, setInventoryRows] = useState([]);
-      const [files, setFiles] = useState({ sales: '', purchases: '', inventory: '' });
-      const chartRef = useRef(null);
-      const chartInstanceRef = useRef(null);
+      const [supplierInvoiceRows, setSupplierInvoiceRows] = useState([]);
+      const [cashInHand, setCashInHand] = useState('0');
+      const [cashInBank, setCashInBank] = useState('0');
+      const [files, setFiles] = useState({ sales: '', purchases: '', inventory: '', supplierInvoices: '' });
+      const topProductsChartRef = useRef(null);
+      const supplierChartRef = useRef(null);
+      const weeklyChartRef = useRef(null);
+      const dailyComparisonChartRef = useRef(null);
+      const weeklyTotalsChartRef = useRef(null);
+      const topProductsChartInstanceRef = useRef(null);
+      const supplierChartInstanceRef = useRef(null);
+      const weeklyChartInstanceRef = useRef(null);
+      const dailyComparisonChartInstanceRef = useRef(null);
+      const weeklyTotalsChartInstanceRef = useRef(null);
 
       const metrics = useMemo(() => {
         let totalSales = 0;
         let totalCost = 0;
         let totalMargin = 0;
+        let totalSalesWithTax = 0;
+        let totalSalesTax = 0;
+        let totalReportedMargin = 0;
+        let lineSalesWithTax = 0;
+        let lineSalesTax = 0;
         let totalPurchases = 0;
         let inventoryValue = 0;
+        let inventoryUnits = 0;
+        let totalSupplierInvoices = 0;
+        let supplierInvoicesMerchandise = 0;
+        let supplierInvoicesOtherExpenses = 0;
+        let pendingPayables = 0;
+        let pendingPayablesMerchandise = 0;
+        let pendingPayablesOtherExpenses = 0;
+        let overduePayables = 0;
         const productSales = {};
         const paymentSales = {};
+        const supplierSpend = {};
         const orders = new Set();
+        const saleOrders = new Set();
+        const refundOrders = new Set();
+        const salesByProduct = {};
+        const weeklyBuckets = {};
+        const salesByDate = {};
+        const today = new Date();
+        today.setHours(0, 0, 0, 0);
 
         salesRows.forEach(row => {
           totalSales += row.subtotalNeto || 0;
           totalCost += row.costoTotal || 0;
           totalMargin += row.margenCalculado || 0;
-          if (row.ref) orders.add(row.ref);
+          if (row.ref && !orders.has(row.ref)) {
+            orders.add(row.ref);
+            totalSalesWithTax += row.totalPedido || 0;
+            totalSalesTax += row.impuestoPedido || 0;
+            totalReportedMargin += row.margenPedido || 0;
+          }
+
+          const lineTax = toNumber(row.impuestoLinea);
+          lineSalesTax += lineTax;
+          lineSalesWithTax += (row.subtotalNeto || 0) + lineTax;
+
+          if (row.ref) {
+            const isRefund = isRefundReference(row.ref) || (row.subtotalNeto || 0) < 0;
+            if (isRefund) refundOrders.add(row.ref);
+            else saleOrders.add(row.ref);
+          }
           productSales[row.producto] = (productSales[row.producto] || 0) + (row.subtotalNeto || 0);
+          salesByProduct[row.producto] = (salesByProduct[row.producto] || 0) + (row.cantidad || 0);
           paymentSales[row.metodoPago] = (paymentSales[row.metodoPago] || 0) + (row.subtotalNeto || 0);
+
+          const parsedDate = parseDateValue(row.fecha);
+          if (parsedDate) {
+            const dateKey = parsedDate.toISOString().slice(0, 10);
+            if (!salesByDate[dateKey]) {
+              salesByDate[dateKey] = { date: parsedDate, totalSales: 0, totalOrderLines: 0 };
+            }
+            salesByDate[dateKey].totalSales += row.subtotalNeto || 0;
+            salesByDate[dateKey].totalOrderLines += 1;
+
+            const weekStart = getWeekStart(parsedDate);
+            const key = weekStart.toISOString().slice(0, 10);
+            if (!weeklyBuckets[key]) {
+              weeklyBuckets[key] = { weekStart, totalSales: 0, totalUnits: 0, totalOrderLines: 0 };
+            }
+            weeklyBuckets[key].totalSales += row.subtotalNeto || 0;
+            weeklyBuckets[key].totalOrderLines += 1;
+          }
         });
 
         purchaseRows.forEach(row => {
-          const total = toNumber(getByAliases(row, ['total sin impuestos', 'subtotal sin impuestos', 'precio total', 'total', 'subtotal', 'importe', 'amount']));
-          totalPurchases += total;
+          const netPurchase = row.subtotal || 0;
+          totalPurchases += netPurchase;
+          supplierSpend[row.proveedor] = (supplierSpend[row.proveedor] || 0) + netPurchase;
         });
 
         inventoryRows.forEach(row => {
-          const qty = toNumber(getByAliases(row, ['cantidad a mano', 'on hand', 'stock', 'quantity on hand', 'cantidad disponible', 'disponible']));
-          const cost = toNumber(getByAliases(row, ['coste', 'costo', 'cost', 'standard price', 'precio de coste']));
-          const value = toNumber(getByAliases(row, ['valor inventario', 'inventory value', 'valor', 'valuation']));
-          inventoryValue += value || (qty * cost);
+          inventoryValue += row.valor || (row.cantidad * row.costo);
+          inventoryUnits += row.cantidad || 0;
+        });
+
+        supplierInvoiceRows.forEach(row => {
+          totalSupplierInvoices += row.total || 0;
+          if (row.tipoFactura === 'mercaderia') supplierInvoicesMerchandise += row.total || 0;
+          else supplierInvoicesOtherExpenses += row.total || 0;
+
+          pendingPayables += row.pagada ? 0 : (row.saldo || row.total || 0);
+          if (!row.pagada) {
+            if (row.tipoFactura === 'mercaderia') pendingPayablesMerchandise += row.saldo || row.total || 0;
+            else pendingPayablesOtherExpenses += row.saldo || row.total || 0;
+          }
+
+          const dueDate = parseDateValue(row.vencimiento);
+          if (!row.pagada && dueDate && dueDate < today) overduePayables += row.saldo || row.total || 0;
+          if (row.tipoFactura === 'mercaderia') {
+            supplierSpend[row.proveedor] = (supplierSpend[row.proveedor] || 0) + (row.total || 0);
+          }
         });
 
         const topProducts = Object.entries(productSales).sort((a, b) => b[1] - a[1]).slice(0, 10);
+        const weeklyComparative = Object.values(weeklyBuckets)
+          .sort((a, b) => a.weekStart - b.weekStart)
+          .map(bucket => ({
+            label: formatWeekLabel(bucket.weekStart),
+            totalSales: bucket.totalSales,
+            totalOrderLines: bucket.totalOrderLines
+          }));
+
+        const weekKeys = Object.keys(weeklyBuckets).sort();
+        const currentWeekKey = weekKeys.length ? weekKeys[weekKeys.length - 1] : null;
+        const previousWeekKey = weekKeys.length > 1 ? weekKeys[weekKeys.length - 2] : null;
+        const currentWeekStart = currentWeekKey ? weeklyBuckets[currentWeekKey].weekStart : null;
+        const previousWeekStart = previousWeekKey ? weeklyBuckets[previousWeekKey].weekStart : null;
+        const dayLabels = ['Lun', 'Mar', 'Mie', 'Jue', 'Vie', 'Sab', 'Dom'];
+        const currentWeekDailySales = [0, 0, 0, 0, 0, 0, 0];
+        const previousWeekDailySales = [0, 0, 0, 0, 0, 0, 0];
+        const currentWeekDailyOrderLines = [0, 0, 0, 0, 0, 0, 0];
+        const previousWeekDailyOrderLines = [0, 0, 0, 0, 0, 0, 0];
+
+        Object.values(salesByDate).forEach(item => {
+          const weekStart = getWeekStart(item.date).toISOString().slice(0, 10);
+          const idx = dayIndexMondayFirst(item.date);
+          if (weekStart === currentWeekKey) {
+            currentWeekDailySales[idx] += item.totalSales;
+            currentWeekDailyOrderLines[idx] += item.totalOrderLines;
+          }
+          if (weekStart === previousWeekKey) {
+            previousWeekDailySales[idx] += item.totalSales;
+            previousWeekDailyOrderLines[idx] += item.totalOrderLines;
+          }
+        });
+
+        const dailyComparative = {
+          dayLabels,
+          currentWeekLabel: currentWeekStart ? formatWeekLabel(currentWeekStart) : 'Semana actual',
+          previousWeekLabel: previousWeekStart ? formatWeekLabel(previousWeekStart) : 'Semana anterior',
+          currentWeekDailySales,
+          previousWeekDailySales,
+          currentWeekDailyOrderLines,
+          previousWeekDailyOrderLines
+        };
+
+        const weekTotalsComparison = {
+          labels: [
+            previousWeekStart ? formatWeekLabel(previousWeekStart) : 'Semana anterior',
+            currentWeekStart ? formatWeekLabel(currentWeekStart) : 'Semana actual'
+          ],
+          sales: [
+            previousWeekKey && weeklyBuckets[previousWeekKey] ? weeklyBuckets[previousWeekKey].totalSales : 0,
+            currentWeekKey && weeklyBuckets[currentWeekKey] ? weeklyBuckets[currentWeekKey].totalSales : 0
+          ],
+          orderLines: [
+            previousWeekKey && weeklyBuckets[previousWeekKey] ? weeklyBuckets[previousWeekKey].totalOrderLines : 0,
+            currentWeekKey && weeklyBuckets[currentWeekKey] ? weeklyBuckets[currentWeekKey].totalOrderLines : 0
+          ]
+        };
+
+        const monthTotals = {};
+        Object.values(salesByDate).forEach(item => {
+          const key = monthKey(item.date);
+          if (!monthTotals[key]) {
+            monthTotals[key] = { totalSales: 0, weeklySales: {} };
+          }
+          monthTotals[key].totalSales += item.totalSales;
+          const weekStartKey = getWeekStart(item.date).toISOString().slice(0, 10);
+          monthTotals[key].weeklySales[weekStartKey] = (monthTotals[key].weeklySales[weekStartKey] || 0) + item.totalSales;
+        });
+
+        const monthKeys = Object.keys(monthTotals).sort();
+        const currentMonthKey = monthKeys.length ? monthKeys[monthKeys.length - 1] : null;
+        const previousMonthKey = monthKeys.length > 1 ? monthKeys[monthKeys.length - 2] : null;
+        const currentMonthDate = currentMonthKey ? new Date(`${currentMonthKey}-01T00:00:00`) : new Date();
+        const previousMonthDate = previousMonthKey ? new Date(`${previousMonthKey}-01T00:00:00`) : new Date(currentMonthDate.getFullYear(), currentMonthDate.getMonth() - 1, 1);
+        const currentMonthSales = currentMonthKey ? monthTotals[currentMonthKey].totalSales : 0;
+        const previousMonthSales = previousMonthKey ? monthTotals[previousMonthKey].totalSales : 0;
+        const currentMonthWeeklyValues = currentMonthKey ? Object.values(monthTotals[currentMonthKey].weeklySales) : [];
+        const avgWeeklyCurrentMonth = currentMonthWeeklyValues.length
+          ? currentMonthWeeklyValues.reduce((sum, value) => sum + value, 0) / currentMonthWeeklyValues.length
+          : 0;
+
+        const monthStart = new Date(currentMonthDate.getFullYear(), currentMonthDate.getMonth(), 1);
+        const monthEnd = new Date(currentMonthDate.getFullYear(), currentMonthDate.getMonth() + 1, 0);
+        const calendarWeeksInMonth = new Set();
+        for (let d = new Date(monthStart); d <= monthEnd; d.setDate(d.getDate() + 1)) {
+          calendarWeeksInMonth.add(getWeekStart(d).toISOString().slice(0, 10));
+        }
+        const totalWeeksInMonth = calendarWeeksInMonth.size;
+        const weeksWithSales = currentMonthWeeklyValues.length;
+        const projectedMonthSales = weeksWithSales
+          ? currentMonthSales + Math.max(totalWeeksInMonth - weeksWithSales, 0) * avgWeeklyCurrentMonth
+          : currentMonthSales;
+        const projectionDelta = projectedMonthSales - currentMonthSales;
+
+        const monthlyComparison = {
+          currentMonthLabel: formatMonthLabel(currentMonthDate),
+          previousMonthLabel: formatMonthLabel(previousMonthDate),
+          currentMonthSales,
+          previousMonthSales,
+          projectedMonthSales,
+          projectionDelta,
+          weeksWithSales,
+          totalWeeksInMonth
+        };
+
         const payments = Object.entries(paymentSales).sort((a, b) => b[1] - a[1]);
+        const topSuppliers = Object.entries(supplierSpend).sort((a, b) => b[1] - a[1]).slice(0, 8);
+        const inventoryWithoutRotation = inventoryRows
+          .filter(row => (row.cantidad || 0) > 0 && !salesByProduct[row.producto])
+          .sort((a, b) => (b.valor || 0) - (a.valor || 0))
+          .slice(0, 5);
+        const gmroi = inventoryValue > 0 ? totalMargin / inventoryValue : 0;
+        const stockToSalesRatio = totalSales > 0 ? inventoryValue / totalSales : 0;
+        const supplierDependency = totalPurchases > 0 && topSuppliers.length ? topSuppliers[0][1] / totalPurchases : 0;
+        const cashBase = Math.max(totalSales - totalPurchases - pendingPayables, 0);
+        const distributableCash = Math.max(toNumber(cashInHand), 0) + Math.max(toNumber(cashInBank), 0);
+        const profitFirstBuckets = {
+          ownerCompensation: distributableCash * PROFIT_FIRST_TARGETS.ownerCompensation,
+          merchandise: distributableCash * PROFIT_FIRST_TARGETS.merchandise,
+          tax: distributableCash * PROFIT_FIRST_TARGETS.tax,
+          profit: distributableCash * PROFIT_FIRST_TARGETS.profit
+        };
+
+        if (totalSalesWithTax <= 0 && lineSalesWithTax > 0) {
+          totalSalesWithTax = lineSalesWithTax;
+          totalSalesTax = lineSalesTax;
+        }
 
         return {
           totalSales,
           totalCost,
           totalMargin,
+          totalSalesWithTax,
+          totalSalesTax,
+          totalReportedMargin,
           totalPurchases,
           inventoryValue,
+          inventoryUnits,
+          totalSupplierInvoices,
+          supplierInvoicesMerchandise,
+          supplierInvoicesOtherExpenses,
+          pendingPayables,
+          pendingPayablesMerchandise,
+          pendingPayablesOtherExpenses,
+          overduePayables,
           marginPercent: totalSales ? totalMargin / totalSales : 0,
           topProducts,
+          weeklyComparative,
+          dailyComparative,
+          weekTotalsComparison,
+          monthlyComparison,
           payments,
-          orderCount: orders.size,
-          avgTicket: orders.size ? totalSales / orders.size : 0
+          topSuppliers,
+          gmroi,
+          stockToSalesRatio,
+          supplierDependency,
+          cashBase,
+          distributableCash,
+          profitFirstBuckets,
+          inventoryWithoutRotation,
+          parserMarginGap: totalReportedMargin ? totalMargin - totalReportedMargin : 0,
+          orderCount: saleOrders.size,
+          refundOrderCount: refundOrders.size,
+          avgTicket: saleOrders.size ? totalSales / saleOrders.size : 0
         };
-      }, [salesRows, purchaseRows, inventoryRows]);
+      }, [salesRows, purchaseRows, inventoryRows, supplierInvoiceRows, cashInHand, cashInBank]);
 
       useEffect(() => {
-        if (!chartRef.current) return;
-        if (chartInstanceRef.current) chartInstanceRef.current.destroy();
-        chartInstanceRef.current = new Chart(chartRef.current, {
+        if (!topProductsChartRef.current) return;
+        if (topProductsChartInstanceRef.current) topProductsChartInstanceRef.current.destroy();
+        topProductsChartInstanceRef.current = new Chart(topProductsChartRef.current, {
           type: 'bar',
           data: {
             labels: metrics.topProducts.map(([name]) => String(name).slice(0, 30)),
@@ -266,16 +953,200 @@
         });
       }, [metrics.topProducts]);
 
+      useEffect(() => {
+        if (!supplierChartRef.current) return;
+        if (supplierChartInstanceRef.current) supplierChartInstanceRef.current.destroy();
+        supplierChartInstanceRef.current = new Chart(supplierChartRef.current, {
+          type: 'doughnut',
+          data: {
+            labels: metrics.topSuppliers.map(([name]) => String(name).slice(0, 28)),
+            datasets: [{
+              label: 'Gasto por proveedor',
+              data: metrics.topSuppliers.map(([, value]) => value),
+              backgroundColor: ['#f97316', '#fb7185', '#f59e0b', '#14b8a6', '#0ea5e9', '#84cc16', '#8b5cf6', '#ef4444']
+            }]
+          },
+          options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            plugins: {
+              legend: { labels: { color: '#cbd5e1' } }
+            }
+          }
+        });
+      }, [metrics.topSuppliers]);
+
+      useEffect(() => {
+        if (!weeklyChartRef.current) return;
+        if (weeklyChartInstanceRef.current) weeklyChartInstanceRef.current.destroy();
+        weeklyChartInstanceRef.current = new Chart(weeklyChartRef.current, {
+          data: {
+            labels: metrics.weeklyComparative.map(item => item.label),
+            datasets: [
+              {
+                type: 'bar',
+                label: 'Ventas netas',
+                data: metrics.weeklyComparative.map(item => item.totalSales),
+                backgroundColor: '#0ea5e9',
+                borderRadius: 6,
+                yAxisID: 'y'
+              },
+              {
+                type: 'line',
+                label: 'Lineas de pedido',
+                data: metrics.weeklyComparative.map(item => item.totalOrderLines),
+                borderColor: '#f97316',
+                backgroundColor: '#f97316',
+                pointRadius: 3,
+                tension: 0.25,
+                yAxisID: 'y1'
+              }
+            ]
+          },
+          options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            plugins: { legend: { labels: { color: '#cbd5e1' } } },
+            scales: {
+              x: { ticks: { color: '#cbd5e1' }, grid: { color: '#334155' } },
+              y: { ticks: { color: '#cbd5e1' }, grid: { color: '#334155' } },
+              y1: {
+                position: 'right',
+                ticks: { color: '#fdba74' },
+                grid: { drawOnChartArea: false }
+              }
+            }
+          }
+        });
+      }, [metrics.weeklyComparative]);
+
+      useEffect(() => {
+        if (!dailyComparisonChartRef.current) return;
+        if (dailyComparisonChartInstanceRef.current) dailyComparisonChartInstanceRef.current.destroy();
+        dailyComparisonChartInstanceRef.current = new Chart(dailyComparisonChartRef.current, {
+          data: {
+            labels: metrics.dailyComparative.dayLabels,
+            datasets: [
+              {
+                type: 'bar',
+                label: `Ventas netas ${metrics.dailyComparative.currentWeekLabel}`,
+                data: metrics.dailyComparative.currentWeekDailySales,
+                backgroundColor: '#22c55e',
+                borderRadius: 6,
+                yAxisID: 'y'
+              },
+              {
+                type: 'bar',
+                label: `Ventas netas ${metrics.dailyComparative.previousWeekLabel}`,
+                data: metrics.dailyComparative.previousWeekDailySales,
+                backgroundColor: '#0ea5e9',
+                borderRadius: 6,
+                yAxisID: 'y'
+              },
+              {
+                type: 'line',
+                label: `Lineas ${metrics.dailyComparative.currentWeekLabel}`,
+                data: metrics.dailyComparative.currentWeekDailyOrderLines,
+                borderColor: '#f59e0b',
+                backgroundColor: '#f59e0b',
+                pointRadius: 3,
+                tension: 0.25,
+                yAxisID: 'y1'
+              },
+              {
+                type: 'line',
+                label: `Lineas ${metrics.dailyComparative.previousWeekLabel}`,
+                data: metrics.dailyComparative.previousWeekDailyOrderLines,
+                borderColor: '#fb7185',
+                backgroundColor: '#fb7185',
+                pointRadius: 3,
+                tension: 0.25,
+                yAxisID: 'y1'
+              }
+            ]
+          },
+          options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            plugins: { legend: { labels: { color: '#cbd5e1' } } },
+            scales: {
+              x: { ticks: { color: '#cbd5e1' }, grid: { color: '#334155' } },
+              y: { ticks: { color: '#cbd5e1' }, grid: { color: '#334155' } },
+              y1: {
+                position: 'right',
+                ticks: { color: '#fdba74' },
+                grid: { drawOnChartArea: false }
+              }
+            }
+          }
+        });
+      }, [metrics.dailyComparative]);
+
+      useEffect(() => {
+        if (!weeklyTotalsChartRef.current) return;
+        if (weeklyTotalsChartInstanceRef.current) weeklyTotalsChartInstanceRef.current.destroy();
+        weeklyTotalsChartInstanceRef.current = new Chart(weeklyTotalsChartRef.current, {
+          type: 'bar',
+          data: {
+            labels: metrics.weekTotalsComparison.labels,
+            datasets: [
+              {
+                label: 'Ventas netas semanales',
+                data: metrics.weekTotalsComparison.sales,
+                backgroundColor: '#14b8a6',
+                borderRadius: 8,
+                yAxisID: 'y'
+              },
+              {
+                label: 'Lineas de pedido semanales',
+                data: metrics.weekTotalsComparison.orderLines,
+                backgroundColor: '#f59e0b',
+                borderRadius: 8,
+                yAxisID: 'y1'
+              }
+            ]
+          },
+          options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            plugins: { legend: { labels: { color: '#cbd5e1' } } },
+            scales: {
+              x: { ticks: { color: '#cbd5e1' }, grid: { color: '#334155' } },
+              y: { ticks: { color: '#cbd5e1' }, grid: { color: '#334155' } },
+              y1: {
+                position: 'right',
+                ticks: { color: '#fdba74' },
+                grid: { drawOnChartArea: false }
+              }
+            }
+          }
+        });
+      }, [metrics.weekTotalsComparison]);
+
       const retailAlerts = useMemo(() => {
         const alerts = [];
         if (!salesRows.length) alerts.push('Cargá ventas POS. Este parser acepta líneas en blanco y hereda los datos del pedido anterior.');
         if (salesRows.length) alerts.push('Ventas POS cargadas: se calcula venta neta como Líneas del pedido/Cantidad × Líneas del pedido/Precio un.');
         if (!inventoryRows.length) alerts.push('Cargá inventario para detectar capital inmovilizado y stock muerto.');
-        if (!purchaseRows.length) alerts.push('Cargá compras para analizar presión de caja y evolución de costos.');
+        if (!purchaseRows.length) alerts.push('Cargá compras para analizar presión de caja, dependencia de proveedor y costo de reposición.');
+        if (!supplierInvoiceRows.length) alerts.push('Cargá facturas de proveedor para medir cuentas por pagar y vencimientos.');
         if (metrics.marginPercent > 0 && metrics.marginPercent < 0.25) alerts.push('Margen bruto bajo: revisar precios, costos o descuentos.');
+        if (Math.abs(metrics.parserMarginGap) > metrics.orderCount) alerts.push('El margen calculado por líneas no coincide exactamente con el margen reportado por Odoo: revisar redondeos y costos nulos.');
         if (metrics.inventoryValue > metrics.totalSales && metrics.totalSales > 0) alerts.push('El valor de inventario supera las ventas cargadas: revisar sobrestock o período analizado.');
+        if (metrics.gmroi > 0 && metrics.gmroi < 1) alerts.push('GMROI bajo: el inventario está devolviendo menos margen del que inmoviliza.');
+        if (metrics.supplierDependency > 0.35) alerts.push('Alta concentración de compra en un proveedor: negociar plazos y diversificar abastecimiento.');
+        if (metrics.pendingPayables > metrics.totalMargin && metrics.totalMargin > 0) alerts.push('Las cuentas por pagar superan el margen bruto del período: priorizá caja y ritmo de compras.');
+        if (metrics.overduePayables > 0) alerts.push('Hay facturas de proveedor vencidas pendientes: revisar calendario de pagos y plazos.');
+        if (metrics.inventoryWithoutRotation.length) alerts.push('Hay stock sin rotación visible en el período cargado: revisar surtido, markdowns o bundles.');
         return alerts;
-      }, [salesRows.length, inventoryRows.length, purchaseRows.length, metrics]);
+      }, [salesRows.length, inventoryRows.length, purchaseRows.length, supplierInvoiceRows.length, metrics]);
+
+      const allocationCards = [
+        { title: 'Compensación dueño (20%)', value: metrics.profitFirstBuckets.ownerCompensation, helper: 'Sueldo objetivo del dueño sobre caja actual.' },
+        { title: 'Mercaderías (50%)', value: metrics.profitFirstBuckets.merchandise, helper: 'Fondo recomendado para reposición de stock.' },
+        { title: 'Impuestos (16%)', value: metrics.profitFirstBuckets.tax, helper: 'Separación preventiva para obligaciones fiscales.' },
+        { title: 'Ganancias (14%)', value: metrics.profitFirstBuckets.profit, helper: 'Reserva de utilidad del período.' }
+      ];
 
       return (
         <main className="min-h-screen p-5 md:p-8">
@@ -284,30 +1155,100 @@
               <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-emerald-500/10 border border-emerald-500/20 text-emerald-300 text-xs mb-4">MVP local para Odoo Community</div>
               <h1 className="text-3xl md:text-5xl font-bold tracking-tight">Retail Doctor Dashboard</h1>
               <p className="text-slate-400 mt-3 max-w-3xl">
-                Parser ajustado para tu export de <b>Órdenes del punto de venta</b>: mantiene juntas las líneas del mismo pedido aunque Odoo deje celdas en blanco.
+                Analizador local para Odoo Community con foco en ventas, compras, stock y facturas de proveedor, usando métricas operativas de retail y disciplina de caja por asignación.
               </p>
             </div>
 
-            <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-8">
-              <UploadCard title="Ventas POS" description="Órdenes del punto de venta con Líneas del pedido." type="sales" loadedRows={salesRows.length} onLoad={(rows, fileName) => { setSalesRows(rows); setFiles(prev => ({...prev, sales: fileName})); }} />
-              <UploadCard title="Compras" description="Reporte de análisis de compras." type="purchases" loadedRows={purchaseRows.length} onLoad={(rows, fileName) => { setPurchaseRows(rows); setFiles(prev => ({...prev, purchases: fileName})); }} />
-              <UploadCard title="Inventario" description="Variantes de producto / stock actual." type="inventory" loadedRows={inventoryRows.length} onLoad={(rows, fileName) => { setInventoryRows(rows); setFiles(prev => ({...prev, inventory: fileName})); }} />
+            <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-4 mb-8">
+              <UploadCard title="Ventas POS" description="Acepta export de órdenes POS y tabla dinámica de Análisis POS." type="sales" loadedRows={salesRows.length} onLoad={(rows, fileName) => { setSalesRows(rows); setFiles(prev => ({...prev, sales: fileName})); }} />
+              <UploadCard title="Compras" description="Acepta export plano de compras y tabla dinámica de Análisis compra." type="purchases" loadedRows={purchaseRows.length} onLoad={(rows, fileName) => { setPurchaseRows(rows); setFiles(prev => ({...prev, purchases: fileName})); }} />
+              <UploadCard title="Inventario" description="Variantes de producto (stock, costo promedio, valor total)." type="inventory" loadedRows={inventoryRows.length} onLoad={(rows, fileName) => { setInventoryRows(rows); setFiles(prev => ({...prev, inventory: fileName})); }} />
+              <UploadCard title="Facturas proveedor" description="Bills con saldo, vencimiento y estado de pago." type="supplierInvoices" loadedRows={supplierInvoiceRows.length} onLoad={(rows, fileName) => { setSupplierInvoiceRows(rows); setFiles(prev => ({...prev, supplierInvoices: fileName})); }} />
             </div>
 
-            <div className="grid grid-cols-1 md:grid-cols-4 gap-4 mb-8">
+            <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4 mb-8">
               <MetricCard title="Ventas netas POS" value={currency.format(metrics.totalSales)} helper={files.sales || 'Sin archivo POS'} />
               <MetricCard title="Margen calculado" value={currency.format(metrics.totalMargin)} helper={`${(metrics.marginPercent * 100).toFixed(1)}% sobre ventas netas`} />
-              <MetricCard title="Tickets" value={metrics.orderCount.toLocaleString('es-CL')} helper={`Ticket promedio: ${currency.format(metrics.avgTicket)}`} />
+              <MetricCard title="Tickets" value={metrics.orderCount.toLocaleString('es-CL')} helper={`Ticket promedio: ${currency.format(metrics.avgTicket)} · Reembolsos: ${metrics.refundOrderCount.toLocaleString('es-CL')}`} />
               <MetricCard title="Valor inventario" value={currency.format(metrics.inventoryValue)} helper={files.inventory || 'Sin archivo inventario'} />
+              <MetricCard title="Compras del período" value={currency.format(metrics.totalPurchases)} helper={`${files.purchases || 'Sin archivo compras'} · base neta sin IVA`} />
+              <MetricCard title="Cuentas por pagar" value={currency.format(metrics.pendingPayables)} helper={`${files.supplierInvoices || 'Sin facturas proveedor'} · Mercadería: ${currency.format(metrics.pendingPayablesMerchandise)} · Otros: ${currency.format(metrics.pendingPayablesOtherExpenses)}`} />
+            </div>
+
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-8">
+              <MetricCard title="Ventas con IVA" value={currency.format(metrics.totalSalesWithTax)} helper={`Impuestos POS: ${currency.format(metrics.totalSalesTax)}`} />
+              <MetricCard title="Margen reportado Odoo" value={currency.format(metrics.totalReportedMargin)} helper="Suma del campo Margen del export por ticket." />
+              <MetricCard title="Delta parser" value={currency.format(metrics.parserMarginGap)} helper="Diferencia entre margen calculado por líneas y margen reportado por Odoo." />
+            </div>
+
+            <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-4 mb-8">
+              <MetricCard title="GMROI" value={percent.format(metrics.gmroi)} helper="Margen bruto generado por cada peso inmovilizado en stock." />
+              <MetricCard title="Stock / Ventas" value={percent.format(metrics.stockToSalesRatio)} helper={`Unidades inventario: ${metrics.inventoryUnits.toLocaleString('es-CL')}`} />
+              <MetricCard title="Dependencia proveedor" value={percent.format(metrics.supplierDependency)} helper="Participación del mayor proveedor en compras y cuentas por pagar." />
+              <MetricCard title="Caja actual declarada" value={currency.format(metrics.distributableCash)} helper={`Base sugerida por flujo: ${currency.format(metrics.cashBase)} · Vencido hoy: ${currency.format(metrics.overduePayables)}`} />
+            </div>
+
+            <div className="rounded-2xl bg-slate-800/80 border border-slate-700 p-5 shadow-lg mb-8">
+              <h2 className="text-xl font-semibold mb-1">Cuadro mensual</h2>
+              <p className="text-sm text-slate-400 mb-4">Comparación mes actual vs mes anterior y proyección de cierre según ritmo semanal del mes actual.</p>
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                <MetricCard
+                  title={`Ventas ${metrics.monthlyComparison.currentMonthLabel}`}
+                  value={currency.format(metrics.monthlyComparison.currentMonthSales)}
+                  helper={`${metrics.monthlyComparison.weeksWithSales}/${metrics.monthlyComparison.totalWeeksInMonth} semanas con ventas`}
+                />
+                <MetricCard
+                  title={`Ventas ${metrics.monthlyComparison.previousMonthLabel}`}
+                  value={currency.format(metrics.monthlyComparison.previousMonthSales)}
+                  helper="Mes completo anterior cargado en el archivo"
+                />
+                <MetricCard
+                  title="Proyección cierre mes"
+                  value={currency.format(metrics.monthlyComparison.projectedMonthSales)}
+                  helper={`Delta proyectado: ${currency.format(metrics.monthlyComparison.projectionDelta)}`}
+                />
+              </div>
+            </div>
+
+            <div className="rounded-2xl bg-slate-800/80 border border-slate-700 p-5 shadow-lg mb-8">
+              <h2 className="text-xl font-semibold mb-1">Comparativo semanal de ventas</h2>
+              <p className="text-sm text-slate-400 mb-4">Barras: ventas netas por semana. Línea: líneas de pedido.</p>
+              <div className="h-80">
+                {metrics.weeklyComparative.length ? <canvas ref={weeklyChartRef}></canvas> : <p className="text-slate-400 text-sm">Cargá ventas con fecha para ver el comparativo semanal.</p>}
+              </div>
+            </div>
+
+            <div className="rounded-2xl bg-slate-800/80 border border-slate-700 p-5 shadow-lg mb-8">
+              <h2 className="text-xl font-semibold mb-1">Comparativo diario vs semana anterior</h2>
+              <p className="text-sm text-slate-400 mb-4">Comparación por día (Lun-Dom) entre semana actual y semana previa en ventas netas y líneas de pedido.</p>
+              <div className="h-80">
+                {metrics.weeklyComparative.length > 1 ? <canvas ref={dailyComparisonChartRef}></canvas> : <p className="text-slate-400 text-sm">Necesitas al menos dos semanas con ventas para ver este comparativo.</p>}
+              </div>
+            </div>
+
+            <div className="rounded-2xl bg-slate-800/80 border border-slate-700 p-5 shadow-lg mb-8">
+              <h2 className="text-xl font-semibold mb-1">Totales semanales comparados</h2>
+              <p className="text-sm text-slate-400 mb-4">Barras verticales con total de ventas netas y lineas de pedido: semana actual vs semana anterior.</p>
+              <div className="h-80">
+                {metrics.weeklyComparative.length > 1 ? <canvas ref={weeklyTotalsChartRef}></canvas> : <p className="text-slate-400 text-sm">Necesitas al menos dos semanas con ventas para comparar totales semanales.</p>}
+              </div>
             </div>
 
             <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-8">
               <div className="rounded-2xl bg-slate-800/80 border border-slate-700 p-5 shadow-lg">
                 <h2 className="text-xl font-semibold mb-1">Ventas por producto</h2>
                 <p className="text-sm text-slate-400 mb-4">Calculado desde las líneas del pedido, sin duplicar el total del ticket.</p>
-                <div className="h-80"><canvas ref={chartRef}></canvas></div>
+                <div className="h-80"><canvas ref={topProductsChartRef}></canvas></div>
               </div>
 
+              <div className="rounded-2xl bg-slate-800/80 border border-slate-700 p-5 shadow-lg">
+                <h2 className="text-xl font-semibold mb-1">Concentración por proveedor</h2>
+                <p className="text-sm text-slate-400 mb-4">Sirve para detectar dependencia de abastecimiento y riesgo de caja.</p>
+                <div className="h-80"><canvas ref={supplierChartRef}></canvas></div>
+              </div>
+            </div>
+
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-8">
               <div className="rounded-2xl bg-slate-800/80 border border-slate-700 p-5 shadow-lg">
                 <h2 className="text-xl font-semibold mb-1">Top productos por venta neta</h2>
                 <p className="text-sm text-slate-400 mb-4">Base para productos estrella, gancho, volumen y cash killers.</p>
@@ -323,6 +1264,22 @@
                   )) : <p className="text-slate-400 text-sm">Todavía no hay ventas cargadas.</p>}
                 </div>
               </div>
+
+              <div className="rounded-2xl bg-slate-800/80 border border-slate-700 p-5 shadow-lg">
+                <h2 className="text-xl font-semibold mb-1">Stock sin rotación visible</h2>
+                <p className="text-sm text-slate-400 mb-4">Cruce simple entre stock actual y ventas POS cargadas en el período.</p>
+                <div className="space-y-3">
+                  {metrics.inventoryWithoutRotation.length ? metrics.inventoryWithoutRotation.map((row, index) => (
+                    <div key={row.producto + index} className="flex items-center justify-between gap-4 bg-slate-900/60 rounded-xl px-4 py-3">
+                      <div className="min-w-0">
+                        <p className="truncate text-sm font-medium">{row.producto}</p>
+                        <p className="text-xs text-slate-400 mt-1">{row.cantidad.toLocaleString('es-CL')} unidades · {row.categoria}</p>
+                      </div>
+                      <span className="text-sm font-semibold whitespace-nowrap">{currency.format(row.valor)}</span>
+                    </div>
+                  )) : <p className="text-slate-400 text-sm">No se detectó stock quieto con los archivos cargados.</p>}
+                </div>
+              </div>
             </div>
 
             <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
@@ -335,11 +1292,57 @@
               </div>
 
               <div className="rounded-2xl bg-slate-800/80 border border-slate-700 p-5 shadow-lg">
-                <h2 className="text-xl font-semibold mb-4">Validación del parser</h2>
+                <h2 className="text-xl font-semibold mb-4">Asignación sugerida de caja</h2>
+                <div className="rounded-xl bg-slate-900/70 p-4 mb-3">
+                  <p className="text-sm text-slate-300 mb-2">Caja actual para distribuir</p>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                    <div>
+                      <p className="text-xs text-slate-400 mb-1">Efectivo</p>
+                      <input
+                        className="w-full rounded-lg bg-slate-950 border border-slate-700 px-3 py-2 text-slate-100"
+                        type="text"
+                        inputMode="decimal"
+                        placeholder="Ej: 350000"
+                        value={cashInHand}
+                        onChange={(event) => setCashInHand(event.target.value)}
+                      />
+                    </div>
+                    <div>
+                      <p className="text-xs text-slate-400 mb-1">Banco</p>
+                      <input
+                        className="w-full rounded-lg bg-slate-950 border border-slate-700 px-3 py-2 text-slate-100"
+                        type="text"
+                        inputMode="decimal"
+                        placeholder="Ej: 2150000"
+                        value={cashInBank}
+                        onChange={(event) => setCashInBank(event.target.value)}
+                      />
+                    </div>
+                  </div>
+                  <p className="text-xs text-slate-300 mt-2">Total disponible para distribuir: {currency.format(metrics.distributableCash)}</p>
+                  <p className="text-xs text-slate-400 mt-1">Se distribuye con Profit First: Dueño 20%, Mercaderías 50%, Impuestos 16%, Ganancias 14%.</p>
+                </div>
                 <div className="space-y-3 text-sm">
+                  {allocationCards.map(card => (
+                    <div key={card.title} className="rounded-xl bg-slate-900/70 p-4">
+                      <p className="font-semibold">{card.title}</p>
+                      <p className="text-slate-100 mt-1">{currency.format(card.value)}</p>
+                      <p className="text-slate-400 mt-1">{card.helper}</p>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </div>
+
+            <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 mt-6">
+              <div className="rounded-2xl bg-slate-800/80 border border-slate-700 p-5 shadow-lg lg:col-span-3">
+                <h2 className="text-xl font-semibold mb-4">Validación del parser</h2>
+                <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-4 text-sm">
                   <div className="rounded-xl bg-slate-900/70 p-4"><p className="font-semibold">Líneas POS usadas</p><p className="text-slate-400 mt-1">{salesRows.length} líneas de producto.</p></div>
-                  <div className="rounded-xl bg-slate-900/70 p-4"><p className="font-semibold">Regla de venta neta</p><p className="text-slate-400 mt-1">Cantidad × Precio un. de la línea.</p></div>
-                  <div className="rounded-xl bg-slate-900/70 p-4"><p className="font-semibold">Campos heredados</p><p className="text-slate-400 mt-1">Fecha, Ref., Estado, Recibo y Sesión del pedido.</p></div>
+                  <div className="rounded-xl bg-slate-900/70 p-4"><p className="font-semibold">Ventas validadas</p><p className="text-slate-400 mt-1">Soporta export de Órdenes POS y Tabla dinámica de Análisis POS.</p></div>
+                  <div className="rounded-xl bg-slate-900/70 p-4"><p className="font-semibold">Compras estructuradas</p><p className="text-slate-400 mt-1">{purchaseRows.length} líneas con proveedor, documento y total.</p></div>
+                  <div className="rounded-xl bg-slate-900/70 p-4"><p className="font-semibold">Facturas proveedor</p><p className="text-slate-400 mt-1">{supplierInvoiceRows.length} documentos con saldo y vencimiento.</p></div>
+                  <div className="rounded-xl bg-slate-900/70 p-4"><p className="font-semibold">Regla base de caja</p><p className="text-slate-400 mt-1">Ventas POS - Compras - CxP pendientes.</p></div>
                 </div>
               </div>
             </div>
