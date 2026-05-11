@@ -651,16 +651,21 @@
       const [cashInHand, setCashInHand] = useState('0');
       const [cashInBank, setCashInBank] = useState('0');
       const [files, setFiles] = useState({ sales: '', purchases: '', inventory: '', supplierInvoices: '' });
+      const [trendProduct, setTrendProduct] = useState('__ALL__');
+      const [trendSearch, setTrendSearch] = useState('');
+      const [trendPeriod, setTrendPeriod] = useState('day');
       const topProductsChartRef = useRef(null);
       const supplierChartRef = useRef(null);
       const weeklyChartRef = useRef(null);
       const dailyComparisonChartRef = useRef(null);
       const weeklyTotalsChartRef = useRef(null);
+      const productEvolutionChartRef = useRef(null);
       const topProductsChartInstanceRef = useRef(null);
       const supplierChartInstanceRef = useRef(null);
       const weeklyChartInstanceRef = useRef(null);
       const dailyComparisonChartInstanceRef = useRef(null);
       const weeklyTotalsChartInstanceRef = useRef(null);
+      const productEvolutionChartInstanceRef = useRef(null);
 
       const metrics = useMemo(() => {
         let totalSales = 0;
@@ -932,6 +937,75 @@
         };
       }, [salesRows, purchaseRows, inventoryRows, supplierInvoiceRows, cashInHand, cashInBank]);
 
+      const trendProducts = useMemo(() => {
+        const totalsByProduct = {};
+        salesRows.forEach(row => {
+          if (!row.producto) return;
+          totalsByProduct[row.producto] = (totalsByProduct[row.producto] || 0) + (row.subtotalNeto || 0);
+        });
+        return Object.entries(totalsByProduct)
+          .sort((a, b) => b[1] - a[1])
+          .map(([name]) => name);
+      }, [salesRows]);
+
+      const filteredTrendProducts = useMemo(() => {
+        const query = normalizeKey(trendSearch);
+        if (!query) return trendProducts.slice(0, 25);
+        return trendProducts
+          .filter(name => normalizeKey(name).includes(query))
+          .slice(0, 25);
+      }, [trendProducts, trendSearch]);
+
+      useEffect(() => {
+        if (trendProduct === '__ALL__') return;
+        if (!trendProducts.includes(trendProduct)) setTrendProduct('__ALL__');
+      }, [trendProduct, trendProducts]);
+
+      const productTrendSeries = useMemo(() => {
+        const buckets = {};
+
+        salesRows.forEach(row => {
+          if (trendProduct !== '__ALL__' && row.producto !== trendProduct) return;
+          const parsedDate = parseDateValue(row.fecha);
+          if (!parsedDate) return;
+
+          let key = '';
+          let label = '';
+          let sortDate = null;
+
+          if (trendPeriod === 'day') {
+            key = parsedDate.toISOString().slice(0, 10);
+            label = parsedDate.toLocaleDateString('es-CL');
+            sortDate = new Date(parsedDate.getFullYear(), parsedDate.getMonth(), parsedDate.getDate());
+          } else if (trendPeriod === 'week') {
+            const weekStart = getWeekStart(parsedDate);
+            key = weekStart.toISOString().slice(0, 10);
+            label = formatWeekLabel(weekStart);
+            sortDate = weekStart;
+          } else {
+            key = String(parsedDate.getFullYear());
+            label = key;
+            sortDate = new Date(parsedDate.getFullYear(), 0, 1);
+          }
+
+          if (!buckets[key]) {
+            buckets[key] = { label, sortDate, sales: 0, units: 0 };
+          }
+
+          buckets[key].sales += row.subtotalNeto || 0;
+          buckets[key].units += row.cantidad || 0;
+        });
+
+        const ordered = Object.values(buckets).sort((a, b) => a.sortDate - b.sortDate);
+        return {
+          labels: ordered.map(item => item.label),
+          sales: ordered.map(item => item.sales),
+          units: ordered.map(item => item.units),
+          totalSales: ordered.reduce((sum, item) => sum + item.sales, 0),
+          totalUnits: ordered.reduce((sum, item) => sum + item.units, 0)
+        };
+      }, [salesRows, trendProduct, trendPeriod]);
+
       useEffect(() => {
         if (!topProductsChartRef.current) return;
         if (topProductsChartInstanceRef.current) topProductsChartInstanceRef.current.destroy();
@@ -1123,6 +1197,58 @@
         });
       }, [metrics.weekTotalsComparison]);
 
+      useEffect(() => {
+        if (!productEvolutionChartRef.current) return;
+        if (productEvolutionChartInstanceRef.current) productEvolutionChartInstanceRef.current.destroy();
+        if (!productTrendSeries.labels.length) return;
+
+        const periodLabel = trendPeriod === 'day' ? 'día' : trendPeriod === 'week' ? 'semana' : 'año';
+        const productLabel = trendProduct === '__ALL__' ? 'Todos los productos' : trendProduct;
+
+        productEvolutionChartInstanceRef.current = new Chart(productEvolutionChartRef.current, {
+          type: 'line',
+          data: {
+            labels: productTrendSeries.labels,
+            datasets: [
+              {
+                label: `Ventas netas (${productLabel})`,
+                data: productTrendSeries.sales,
+                borderColor: '#22d3ee',
+                backgroundColor: 'rgba(34, 211, 238, 0.18)',
+                tension: 0.25,
+                pointRadius: 3,
+                fill: true,
+                yAxisID: 'y'
+              },
+              {
+                label: `Cantidad vendida por ${periodLabel}`,
+                data: productTrendSeries.units,
+                borderColor: '#f59e0b',
+                backgroundColor: '#f59e0b',
+                tension: 0.25,
+                pointRadius: 3,
+                yAxisID: 'y1'
+              }
+            ]
+          },
+          options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            interaction: { mode: 'index', intersect: false },
+            plugins: { legend: { labels: { color: '#cbd5e1' } } },
+            scales: {
+              x: { ticks: { color: '#cbd5e1' }, grid: { color: '#334155' } },
+              y: { ticks: { color: '#67e8f9' }, grid: { color: '#334155' } },
+              y1: {
+                position: 'right',
+                ticks: { color: '#fdba74' },
+                grid: { drawOnChartArea: false }
+              }
+            }
+          }
+        });
+      }, [productTrendSeries, trendPeriod, trendProduct]);
+
       const retailAlerts = useMemo(() => {
         const alerts = [];
         if (!salesRows.length) alerts.push('Cargá ventas POS. Este parser acepta líneas en blanco y hereda los datos del pedido anterior.');
@@ -1231,6 +1357,80 @@
               <p className="text-sm text-slate-400 mb-4">Barras verticales con total de ventas netas y lineas de pedido: semana actual vs semana anterior.</p>
               <div className="h-80">
                 {metrics.weeklyComparative.length > 1 ? <canvas ref={weeklyTotalsChartRef}></canvas> : <p className="text-slate-400 text-sm">Necesitas al menos dos semanas con ventas para comparar totales semanales.</p>}
+              </div>
+            </div>
+
+            <div className="rounded-2xl bg-slate-800/80 border border-slate-700 p-5 shadow-lg mb-8">
+              <h2 className="text-xl font-semibold mb-1">Evolución de ventas por producto</h2>
+              <p className="text-sm text-slate-400 mb-4">Estilo mercado financiero: línea temporal con ventas en $ y cantidad vendida, filtrable por producto y período.</p>
+
+              <div className="flex flex-col md:flex-row md:items-end gap-4 mb-4">
+                <div className="w-full md:w-96">
+                  <label className="block text-xs text-slate-400 mb-2">Producto (búsqueda parcial)</label>
+                  <input
+                    className="w-full rounded-lg bg-slate-950 border border-slate-700 px-3 py-2 text-slate-100"
+                    type="text"
+                    placeholder="Escribí parte del nombre del producto..."
+                    value={trendSearch}
+                    onChange={(event) => setTrendSearch(event.target.value)}
+                  />
+                  <div className="mt-2 rounded-lg border border-slate-700 bg-slate-900/70 p-2 max-h-48 overflow-auto space-y-1">
+                    <button
+                      type="button"
+                      className={`w-full text-left rounded px-2 py-1 text-sm ${trendProduct === '__ALL__' ? 'bg-cyan-500/20 text-cyan-200' : 'text-slate-300 hover:bg-slate-800'}`}
+                      onClick={() => {
+                        setTrendProduct('__ALL__');
+                        setTrendSearch('');
+                      }}
+                    >
+                      Todos los productos
+                    </button>
+                    {filteredTrendProducts.length ? filteredTrendProducts.map(name => (
+                      <button
+                        key={name}
+                        type="button"
+                        className={`w-full text-left rounded px-2 py-1 text-sm ${trendProduct === name ? 'bg-cyan-500/20 text-cyan-200' : 'text-slate-300 hover:bg-slate-800'}`}
+                        onClick={() => {
+                          setTrendProduct(name);
+                          setTrendSearch(name);
+                        }}
+                      >
+                        {name}
+                      </button>
+                    )) : <p className="px-2 py-1 text-sm text-slate-500">Sin coincidencias</p>}
+                  </div>
+                </div>
+
+                <div>
+                  <p className="text-xs text-slate-400 mb-2">Período</p>
+                  <div className="inline-flex rounded-lg border border-slate-700 overflow-hidden">
+                    {[
+                      { id: 'day', label: 'Día' },
+                      { id: 'week', label: 'Semana' },
+                      { id: 'year', label: 'Año' }
+                    ].map(option => (
+                      <button
+                        key={option.id}
+                        type="button"
+                        className={`px-4 py-2 text-sm ${trendPeriod === option.id ? 'bg-cyan-500/20 text-cyan-200' : 'bg-slate-900 text-slate-300 hover:bg-slate-800'}`}
+                        onClick={() => setTrendPeriod(option.id)}
+                      >
+                        {option.label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                <div className="md:ml-auto text-sm text-slate-300">
+                  <p>Total ventas: <span className="font-semibold text-cyan-200">{currency.format(productTrendSeries.totalSales)}</span></p>
+                  <p>Total unidades: <span className="font-semibold text-amber-200">{productTrendSeries.totalUnits.toLocaleString('es-CL')}</span></p>
+                </div>
+              </div>
+
+              <div className="h-80">
+                {productTrendSeries.labels.length
+                  ? <canvas ref={productEvolutionChartRef}></canvas>
+                  : <p className="text-slate-400 text-sm">Cargá ventas con fecha válida para ver la evolución por producto.</p>}
               </div>
             </div>
 
